@@ -13193,10 +13193,10 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
         if (tc->alias_storage) {
             tc->ac->data = tc->alias_storage->data;
             tc->ac->buffer = tc->alias_storage->buffer;
-            out->data = (char *) tc->ac->data + (tc->variant == "partial_ac" ? sizeof(float) : 0);
+            out->data = (char *) tc->ac->data + (tc->variant == "partial_ac" ? 4*sizeof(float) : 0);
             out->buffer = tc->ac->buffer;
         } else if (tc->variant == "alias_bd") {
-            out->data = (char *) tc->bd->data + (tc->t - 1)*sizeof(float);
+            out->data = tc->bd->data;
             out->buffer = tc->bd->buffer;
         }
         std::vector<ggml_tensor *> checked = tc->fusion_test_nodes();
