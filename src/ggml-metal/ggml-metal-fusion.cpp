@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -105,6 +106,75 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
 }
 
 // ---- pattern checks ------------------------------------------------------
+
+static bool ggml_metal_residual_norm_enabled(const ggml_metal_device_props * props) {
+    const char * value = getenv("GGML_METAL_RESIDUAL_NORM");
+    if (value && strcmp(value, "0") != 0 && strcmp(value, "1") != 0) {
+        GGML_ABORT("GGML_METAL_RESIDUAL_NORM must be 0 or 1");
+    }
+    return value && strcmp(value, "1") == 0 && !props->has_tensor && props->device_id == GGML_METAL_DEVICE_M2_ULTRA;
+}
+
+// Shared wrappers can map the same host storage with different Metal buffer identities.
+static bool ggml_metal_residual_norm_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (ggml_metal_fusion_overlap(a, b)) return true;
+    const auto ba = a->view_src ? a->view_src->buffer : a->buffer;
+    const auto bb = b->view_src ? b->view_src->buffer : b->buffer;
+    if (!ggml_metal_buffer_is_shared((ggml_metal_buffer_t) ba->context) ||
+        !ggml_metal_buffer_is_shared((ggml_metal_buffer_t) bb->context)) return false;
+    // Private buffers have synthetic addresses, which do not identify host storage.
+    const auto first = reinterpret_cast<uintptr_t>(a->data);
+    const auto second = reinterpret_cast<uintptr_t>(b->data);
+    return first <= second ? second - first < ggml_nbytes(a) : first - second < ggml_nbytes(b);
+}
+
+static bool ggml_metal_fusion_check_residual_norm(
+        const ggml_metal_fusion *, const ggml_tensor * const * nodes,
+        const ggml_cgraph *, const int *, int, ggml_metal_fusion_mode mode) {
+    const ggml_tensor * add = nodes[0];
+    const ggml_tensor * norm = nodes[1];
+    const ggml_tensor * mul = nodes[2];
+    const ggml_tensor * dst = nodes[3];
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * weight = mul->src[1];
+    const ggml_tensor * bias = dst->src[1];
+    if (!a || !b || !weight || !bias || norm->src[0] != add || mul->src[0] != norm || dst->src[0] != mul ||
+        add->ne[0] != 1024 || add->ne[1] < 1 || add->ne[2] != 1 || add->ne[3] != 1 ||
+        ggml_nelements(add) > INT32_MAX) return false;
+    for (const auto * tensor : {add, norm, mul, dst}) {
+        if (tensor->view_src) return false;
+    }
+    for (const auto * tensor : {a, b, add, norm, mul, dst}) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_are_same_shape(tensor, add) || !ggml_is_contiguous(tensor)) return false;
+    }
+    for (const auto * tensor : {weight, bias}) {
+        if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != 1024 || ggml_nelements(tensor) != 1024 ||
+            !ggml_is_contiguous(tensor)) return false;
+    }
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) return true;
+    for (const auto * tensor : {a, b, add, norm, mul, dst, weight, bias}) {
+        const auto buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (!tensor->data || !buffer || reinterpret_cast<uintptr_t>(tensor->data) % 16 != 0) return false;
+    }
+    // Restrict activations to one arena, where the existing Metal offset comparisons identify physical overlap.
+    for (const auto * tensor : {b, add, norm, mul, dst}) {
+        if (!ggml_metal_fusion_same_buffer(a, tensor)) return false;
+    }
+    for (const auto * tensor : {a, b, add, norm, mul, dst}) {
+        if (ggml_metal_residual_norm_overlap(tensor, weight) || ggml_metal_residual_norm_overlap(tensor, bias)) return false;
+    }
+    // The original NORM+MUL+ADD also rejects a partial overlap with its residual input.
+    if (dst->data != add->data && ggml_metal_residual_norm_overlap(dst, add)) return false;
+    // Each lane reads its residual operands before overwriting that lane's vector after the mean reduction.
+    for (const auto * output : {add, dst}) {
+        for (const auto * input : {a, b}) {
+            const bool exact = output->data == input->data && ggml_are_same_layout(output, input);
+            if (!exact && ggml_metal_residual_norm_overlap(output, input)) return false;
+        }
+    }
+    return true;
+}
 
 // NORM/RMS_NORM + MUL + ADD: the weight/bias of each fused step must match the norm input
 // width, be contiguous rows, and the fused outputs must stay F32
@@ -711,6 +781,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_norm_mul_add     = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_residual_norm    = { GGML_OP_ADD, GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_rms_norm_mul     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_rms_norm_mul_add = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
@@ -786,6 +857,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_RESIDUAL_NORM,  ops_residual_norm,          {},     false, ggml_metal_fusion_check_residual_norm },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -836,6 +908,8 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // The full check validates this kernel's aliases without extending input lifetimes.
+            if (fusion.id == GGML_METAL_FUSION_RESIDUAL_NORM) continue;
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
@@ -1074,6 +1148,7 @@ static bool ggml_metal_fusion_check_memory_ranges(
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
 const ggml_metal_fusion * ggml_metal_fusion_next(
+        const ggml_metal_device_props * props,
         const ggml_cgraph * gf,
         const int * node_idxs,
         int n_idxs,
@@ -1084,6 +1159,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     int best = 1;
 
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == GGML_METAL_FUSION_RESIDUAL_NORM && !ggml_metal_residual_norm_enabled(props)) continue;
         const int n_ops = (int) fusion.ops.size();
 
         // only look for a longer match than the current best
@@ -1168,7 +1244,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
 // span from idx to the last matched node (intermediate views are packed along).
-int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+int ggml_metal_fusion_max(const ggml_metal_device_props * props, const ggml_cgraph * gf, int idx) {
     // a view node cannot start a pattern - pack it alone
     if (ggml_op_is_empty(gf->nodes[idx]->op)) {
         return 1;
@@ -1192,7 +1268,7 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
     while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
         int len = 1;
-        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
+        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(props, gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
             break;
         }

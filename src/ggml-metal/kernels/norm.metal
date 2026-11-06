@@ -104,6 +104,93 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
 template [[host_name("kernel_norm_mul_f32_4")]]     kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 3>;
 
+// The separate residual ADD rounds before the normalization reductions and centering.
+inline float4 residual_norm_load(device const float4 * a, device const float4 * b, int i) {
+    #pragma METAL fp math_mode(safe)
+    #pragma METAL fp contract(off)
+    return a[i] + b[i];
+}
+
+kernel void kernel_residual_norm_f32_4(
+        constant ggml_metal_kargs_norm & args,
+        device const char * src0,
+        device const char * src1_0,
+        device const char * src1_1,
+        device       char * dst,
+        device const char * residual,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    typedef float4 T;
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const T * x = (device const T *) (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const T * r = (device const T *) (residual + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+
+    device const T * f0 = (device const T *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
+    device const T * f1 = (device const T *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
+
+    T sumft(0.0f);
+
+    float sumf = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        sumft += residual_norm_load(x, r, i00);
+    }
+    sumf = dot(sumft, T(1.0f));
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean = sumf/args.ne00;
+
+    device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        y[i00] = residual_norm_load(x, r, i00) - mean;
+        sumf += dot(y[i00], y[i00]);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float variance = sumf/args.ne00;
+
+    const float scale = 1.0f/sqrt(variance + args.eps);
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        y[i00] = (y[i00]*scale)*f0[i00] + f1[i00];
+    }
+}
+
+
 // F == 1 : rms_norm (no fuse)
 // F == 2 : rms_norm + mul
 // F == 3 : rms_norm + mul + add

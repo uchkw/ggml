@@ -2282,6 +2282,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_residual_norm(ggml_metal_library_t lib) {
+    const char * name = "kernel_residual_norm_f32_4";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    res.smem = 32*sizeof(float);
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_NORM || op->op == GGML_OP_RMS_NORM);
 

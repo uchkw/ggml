@@ -87,7 +87,7 @@ struct ggml_metal_op {
         assert(use_fusion());
         assert(i0 >= 0 && i0 < n_nodes());
 
-        return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
+        return ggml_metal_fusion_next(ggml_metal_device_get_props(dev), gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
     }
 
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
@@ -4155,6 +4155,52 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static int ggml_metal_op_residual_norm(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * add = ctx->node(idx);
+    const ggml_tensor * norm = ctx->node(idx + 1);
+    const ggml_tensor * weight = ctx->node(idx + 2)->src[1];
+    const ggml_tensor * dst = ctx->node(idx + 3);
+    const ggml_tensor * bias = dst->src[1];
+    auto pipeline = ggml_metal_library_get_pipeline_residual_norm(ctx->lib);
+    const auto original = ggml_metal_library_get_pipeline_norm(ctx->lib, norm, 3);
+    // At width 1024 the existing float4 dispatch doubles 32 to 256 threads, subject to the pipeline limit.
+    if (ggml_metal_pipeline_max_theads_per_threadgroup(original) < 256 ||
+        ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < 256) return 0;
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    ggml_metal_kargs_norm args = {
+        /*.ne00   =*/ 1024,
+        /*.ne00_t =*/ 256,
+        /*.nb1    =*/ dst->nb[1],
+        /*.nb2    =*/ dst->nb[2],
+        /*.nb3    =*/ dst->nb[3],
+        /*.eps    =*/ eps,
+        /*.nef1   =*/ { (int32_t) add->ne[1], 1, 1 },
+        /*.nef2   =*/ { 1, 1, 1 },
+        /*.nef3   =*/ { 1, 1, 1 },
+        /*.nbf1   =*/ { add->nb[1], weight->nb[1], bias->nb[1] },
+        /*.nbf2   =*/ { add->nb[2], weight->nb[2], bias->nb[2] },
+        /*.nbf3   =*/ { add->nb[3], weight->nb[3], bias->nb[3] },
+        /*.scale  =*/ 1.0f,
+    };
+    for (int i = 1; i < 4; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(add->src[0]), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(weight), 2);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(bias), 3);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(dst), 4);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(add->src[1]), 5);
+    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, pipeline.smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, add->ne[1], 1, 1, 256, 1, 1);
+    return 4;
+}
+
 int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     int n_fuse = 1;
     const ggml_metal_fusion * fusion = nullptr;
@@ -4165,6 +4211,16 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         int n = 1;
         fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         n_fuse = n;
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RESIDUAL_NORM) {
+            const int consumed = ggml_metal_op_residual_norm(ctx, idx);
+            if (consumed) {
+                ctx->count_fusions(fusion);
+                return consumed;
+            }
+            fusion = nullptr;
+            n_fuse = 1;
+        }
 
         // snake activation autofuse: mul -> sin -> sqr -> mul -> add
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {
