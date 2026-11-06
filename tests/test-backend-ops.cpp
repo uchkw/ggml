@@ -16,6 +16,7 @@
 
 
 #include "ggml.h"
+#include "test-head-store-cases.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -5269,6 +5270,40 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
 }
 
 // GGML_OP_MUL_MAT
+struct test_attention_head_store : public test_case {
+    const head_store_case c;
+    head_store_graph tensors{};
+
+    explicit test_attention_head_store(const head_store_case & c) : c(c) {}
+
+    std::string op_desc(ggml_tensor *) override { return "ATTENTION_HEAD_STORE"; }
+    std::string vars() override {
+        return "frames=" + std::to_string(c.frames) + ",type=" + ggml_type_name(c.type) + ",variant=" + c.variant;
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        tensors = make_head_store_graph(ctx, c);
+        return tensors.out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        initialize_head_store_graph(tensors);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> outputs{tensors.out};
+        for (auto * tensor : {tensors.mm, tensors.cont}) {
+            if (tensor && (tensor->flags & GGML_TENSOR_FLAG_OUTPUT)) outputs.push_back(tensor);
+        }
+        return outputs;
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -12537,6 +12572,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // F32 by F32 whose src1 asks for GGML_PREC_F32: SEMamba's output projections and a square product
+    for (const auto & c : head_store_cases()) {
+        if (c.cpu_reference) test_cases.emplace_back(new test_attention_head_store(c));
+    }
+
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 64, 151*81, 128, -1.0f, 1.0f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 64, 251*161, 128, -1.0f, 1.0f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 1024, 1024, 1024, -1.0f, 1.0f, -1.0f, 1.0f));
