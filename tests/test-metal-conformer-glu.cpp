@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <unistd.h>
 
 using Context = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 using Buffer = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
@@ -139,6 +141,48 @@ static void poison_guard(ggml_backend_t backend) {
     }
 }
 
+/** Two Metal mappings of one host arena expose aliases hidden by distinct buffer identities. */
+struct MappedArena {
+    std::unique_ptr<void, decltype(&std::free)> host{nullptr, std::free};
+    Buffer first{nullptr, ggml_backend_buffer_free};
+    Buffer second{nullptr, ggml_backend_buffer_free};
+
+    void allocate(ggml_backend_t backend, const conformer_glu_graph & tensors, const std::string & variant) {
+        const long page = sysconf(_SC_PAGESIZE);
+        require(page > 0, "cannot obtain the host page size");
+        const size_t bytes = ggml_nbytes(tensors.gate);
+        const size_t stride = ((bytes + 16 + page - 1)/page)*page;
+        const size_t size = 4*stride;
+        void * data = nullptr;
+        require(posix_memalign(&data, (size_t) page, size) == 0, "cannot allocate the mapped GLU arena");
+        host.reset(data);
+        const auto device = ggml_backend_get_device(backend);
+        first.reset(ggml_backend_dev_buffer_from_host_ptr(device, data, size, bytes));
+        second.reset(ggml_backend_dev_buffer_from_host_ptr(device, data, size, bytes));
+        require(first && second && first->context && second->context && first->context != second->context,
+                "cannot create two distinct Metal mappings of the GLU arena");
+        const std::vector<ggml_tensor *> all{tensors.gate, tensors.a, tensors.unary, tensors.mul};
+        const size_t wrapped = variant == "mapped_gate" ? 0 : variant == "mapped_factor" ? 1 :
+                               variant == "mapped_sigmoid" || variant == "mapped_unary_factor" ? 2 : 3;
+        for (size_t i = 0; i < all.size(); ++i) {
+            size_t offset = i*stride;
+            if (i == 2 && variant == "mapped_unary_factor") offset = stride;
+            if (i == 3 && variant == "mapped_partial_gate") offset = 16;
+            require(ggml_backend_tensor_alloc(i == wrapped ? second.get() : first.get(), all[i],
+                        static_cast<char *>(data) + offset) == GGML_STATUS_SUCCESS, "cannot bind the mapped GLU tensor");
+        }
+        if (variant == "mapped_unary_factor") {
+            require(tensors.unary->data == tensors.a->data && tensors.unary->buffer != tensors.a->buffer,
+                    "mapped sigmoid and factor do not alias across wrappers");
+        }
+        if (variant == "mapped_partial_gate") {
+            require(tensors.mul->data == static_cast<char *>(tensors.gate->data) + 16 &&
+                        tensors.mul->buffer != tensors.gate->buffer,
+                    "mapped product and gate do not partially alias across wrappers");
+        }
+    }
+};
+
 static bool run_case(ggml_backend_t backend, const Fusion & fusion, const conformer_glu_case & c, bool expected, FILE * dump) {
     constexpr int nodes = 32;
     Context ctx(ggml_init({ggml_tensor_overhead()*nodes + ggml_graph_overhead_custom(nodes, false), nullptr, true}), ggml_free);
@@ -148,8 +192,15 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const confor
     auto * graph = ggml_new_graph_custom(ctx.get(), nodes, false);
     ggml_build_forward_expand(graph, tensors.out);
     const size_t dependencies = optimize(backend, graph);
-    Buffer buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend), ggml_backend_buffer_free);
-    require(bool(buffer), "cannot allocate GLU tensors");
+    const bool mapped = std::string(c.variant).find("mapped_") == 0;
+    MappedArena arena;
+    Buffer buffer(nullptr, ggml_backend_buffer_free);
+    if (mapped) {
+        arena.allocate(backend, tensors, c.variant);
+    } else {
+        buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        require(bool(buffer), "cannot allocate GLU tensors");
+    }
     size_t protected_values = 0;
     const auto prepare = [&]() {
         conformer_glu_initialize(tensors, c);
@@ -179,10 +230,11 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const confor
                     std::fwrite(selected.data(), 1, selected.size(), dump) == selected.size(), "cannot write GLU comparison bytes");
     }
     std::printf("{\"kind\":\"comparison\",\"type\":\"%s\",\"width\":%lld,\"frames\":%lld,\"swap\":%s,\"variant\":\"%s\","
-                "\"equal_bits\":%s,\"same_input_buffers\":true,\"poison_protected_input_values\":%zu,\"allocation_dependencies\":%zu,"
+                "\"equal_bits\":%s,\"same_input_buffers\":true,\"mapped_wrappers\":%d,"
+                "\"poison_protected_input_values\":%zu,\"allocation_dependencies\":%zu,"
                 "\"sigmoid_marked_output\":%s,\"disabled_fusions\":%llu,\"enabled_fusions\":%llu,\"expected_fusions\":%llu,\"passed\":%s}\n",
                 ggml_type_name(c.type), (long long) c.width, (long long) c.frames, c.swap ? "true" : "false", c.variant,
-                ordinary == selected ? "true" : "false", protected_values, dependencies,
+                ordinary == selected ? "true" : "false", mapped ? 2 : 0, protected_values, dependencies,
                 (tensors.unary->flags & GGML_TENSOR_FLAG_OUTPUT) ? "true" : "false",
                 (unsigned long long) disabled, (unsigned long long) enabled, (unsigned long long) want, ok ? "true" : "false");
     std::fflush(stdout);
@@ -200,7 +252,13 @@ int main(int argc, char ** argv) {
         require(bool(backend), "cannot initialize MTL0");
         const Fusion fusion(backend.get());
         poison_guard(backend.get());
-        const auto cases = conformer_glu_cases();
+        auto cases = conformer_glu_cases();
+        for (bool swap : {false, true}) {
+            for (const char * variant : {"mapped_gate", "mapped_factor", "mapped_sigmoid", "mapped_product",
+                                        "mapped_unary_factor", "mapped_partial_gate"}) {
+                cases.push_back({GGML_TYPE_F32, 1024, 1, swap, variant, false});
+            }
+        }
         size_t failed = 0;
         for (const auto & c : cases) failed += !run_case(backend.get(), fusion, c, expected != 0, dump.get());
         fusion.enable(fusion.info, true);
