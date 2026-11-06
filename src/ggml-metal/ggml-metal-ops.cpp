@@ -4856,6 +4856,8 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+    const int n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_CONV_DW_BIAS_SILU);
+    ggml_tensor * dst = ctx->node(idx + n_fuse - 1);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -4908,7 +4910,7 @@ int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
 
     const bool use_tiled = (nb12 < nb10);
 
-    auto pipeline = ggml_metal_library_get_pipeline_conv_2d_dw(lib, op, use_tiled);
+    auto pipeline = ggml_metal_library_get_pipeline_conv_2d_dw(lib, op, use_tiled, n_fuse > 1);
 
     int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
     nth = std::min(nth, 256);
@@ -4927,11 +4929,15 @@ int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
+
+    if (n_fuse > 1) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->node(idx + 1)->src[1]), 4);
+    }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, tg_x, tg_y, tg_z, nth, 1, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_conv_3d(ggml_metal_op_t ctx, int idx) {

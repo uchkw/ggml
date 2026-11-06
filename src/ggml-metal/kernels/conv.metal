@@ -628,13 +628,21 @@ kernel void kernel_conv_transpose_2d<half>(
     uint3   tpitg[[thread_position_in_threadgroup]],
     uint3     ntg[[threads_per_threadgroup]]);
 
+// The standalone ADD stores a rounded float before the unary operation.
+inline float conv_dw_bias_add(float value, float bias) {
+    #pragma METAL fp math_mode(safe)
+    #pragma METAL fp contract(off)
+    return value + bias;
+}
+
 // grid: x = C tile, y = OH, z = OW * N (for channel-contiguous layouts)
-template <typename TK>
+template <typename TK, bool bias_silu = false>
 kernel void kernel_conv_2d_dw_tiled(
         constant ggml_metal_kargs_conv_2d_dw & args,
         device const char * weights,
         device const char * src,
         device       char * dst,
+        device const float * bias,
         uint3   tgpig[[threadgroup_position_in_grid]],
         uint3   tpitg[[thread_position_in_threadgroup]],
         uint3     ntg[[threads_per_threadgroup]]) {
@@ -695,6 +703,11 @@ kernel void kernel_conv_2d_dw_tiled(
                 acc += x * w;
             }
         }
+    }
+
+    if (bias_silu) {
+        const float value = conv_dw_bias_add(acc, bias[c]);
+        acc = value / (1 + exp(-value));
     }
 
     const uint64_t dst_offs =
@@ -810,6 +823,7 @@ kernel void kernel_conv_2d_dw_tiled<float>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        device const float * bias,
         uint3   tgpig[[threadgroup_position_in_grid]],
         uint3   tpitg[[thread_position_in_threadgroup]],
         uint3     ntg[[threads_per_threadgroup]]);
@@ -820,6 +834,18 @@ kernel void kernel_conv_2d_dw_tiled<half>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        device const float * bias,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_tiled_f32_f32_bias_silu")]]
+kernel void kernel_conv_2d_dw_tiled<float, true>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        device const float * bias,
         uint3   tgpig[[threadgroup_position_in_grid]],
         uint3   tpitg[[thread_position_in_threadgroup]],
         uint3     ntg[[threads_per_threadgroup]]);

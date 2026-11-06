@@ -2517,19 +2517,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw(ggml_metal_library_t lib, const ggml_tensor * op, bool tiled) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw(ggml_metal_library_t lib, const ggml_tensor * op, bool tiled, bool bias_silu) {
     assert(op->op == GGML_OP_CONV_2D_DW);
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->type         == GGML_TYPE_F32);
+    GGML_ASSERT(!bias_silu || (tiled && op->src[0]->type == GGML_TYPE_F32));
 
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_conv_2d_dw%s_%s_%s",
+    snprintf(base, 256, "kernel_conv_2d_dw%s_%s_%s%s",
              tiled ? "_tiled" : "",
-             ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+             ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), bias_silu ? "_bias_silu" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

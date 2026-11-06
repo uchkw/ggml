@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -707,6 +708,78 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+static bool ggml_metal_dw_silu_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_METAL_DW_SILU");
+        if (!value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        GGML_ABORT("GGML_METAL_DW_SILU must be 0 or 1");
+    }();
+    return enabled;
+}
+
+static bool ggml_metal_fusion_check_conv_dw_bias_silu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    if (!ggml_metal_dw_silu_enabled()) return false;
+
+    const int first = node_idxs[idx];
+    if (node_idxs[idx + 1] != first + 3 || node_idxs[idx + 2] != first + 4) return false;
+    int raw_idxs[5];
+    for (int i = 0; i < 5; i++) {
+        raw_idxs[i] = first + i;
+        if (gf->nodes[first + i]->op != fusion->ops_all[i]) return false;
+    }
+
+    const ggml_tensor * conv = nodes[0];
+    const ggml_tensor * perm = gf->nodes[first + 1];
+    const ggml_tensor * view = gf->nodes[first + 2];
+    const ggml_tensor * sum  = nodes[1];
+    const ggml_tensor * dst  = nodes[2];
+    const ggml_tensor * kernel = conv->src[0];
+    const ggml_tensor * input  = conv->src[1];
+    const ggml_tensor * bias   = sum->src[1];
+    if (!kernel || !input || !bias || perm->src[0] != conv || view->src[0] != perm ||
+        sum->src[0] != view || dst->src[0] != sum || ggml_get_unary_op(dst) != GGML_UNARY_OP_SILU) return false;
+
+    const int64_t channels = conv->ne[2], frames = conv->ne[0];
+    const size_t row_bytes = channels*sizeof(float);
+    const int32_t params[6] = {1, 1, 4, 0, 1, 1};
+    if (channels <= 1 || frames < 1 || conv->ne[1] != 1 || conv->ne[3] != 1 ||
+        conv->type != GGML_TYPE_F32 || std::memcmp(conv->op_params, params, sizeof(params)) != 0 ||
+        !ggml_are_same_shape(input, conv) || input->type != GGML_TYPE_F32 ||
+        input->nb[0] != row_bytes || input->nb[2] != sizeof(float) || !ggml_is_contiguously_allocated(input) ||
+        kernel->type != GGML_TYPE_F32 || kernel->ne[0] != 9 || kernel->ne[1] != 1 ||
+        kernel->ne[2] != 1 || kernel->ne[3] != channels || kernel->nb[0] != row_bytes ||
+        kernel->nb[3] != sizeof(float) || !ggml_is_contiguously_allocated(kernel)) return false;
+
+    // A single frame has the same physical output layout with either spatial stride.
+    if (conv->nb[2] != sizeof(float) || (frames > 1 && conv->nb[0] != row_bytes) ||
+        !ggml_is_contiguously_allocated(conv)) return false;
+
+    if (perm->view_src != conv || view->view_src != conv || perm->view_offs != 0 || view->view_offs != 0) return false;
+    for (const ggml_tensor * tensor : {perm, view, sum, dst}) {
+        if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != channels || tensor->ne[1] != frames ||
+            tensor->ne[2] != 1 || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor)) return false;
+    }
+    if (bias->type != GGML_TYPE_F32 || !ggml_is_vector(bias) || bias->ne[0] != channels ||
+        !ggml_is_contiguous(bias)) return false;
+
+    const int output = first + 4;
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 5, fusion->ops_all.data(), &output, 1)) return false;
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!dst->data || !input->data || !kernel->data || !bias->data) return false;
+        // Even an exact input alias races across neighboring convolution positions.
+        if (ggml_metal_fusion_overlap(dst, input) || ggml_metal_fusion_overlap(dst, kernel) ||
+            ggml_metal_fusion_overlap(dst, bias)) return false;
+    }
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -757,6 +830,9 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_conv_dw_bias_silu = {
+    GGML_OP_CONV_2D_DW, GGML_OP_PERMUTE, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY
+};
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -786,6 +862,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_CONV_DW_BIAS_SILU, ops_conv_dw_bias_silu,   {},     true,  ggml_metal_fusion_check_conv_dw_bias_silu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -836,6 +913,8 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // The late overlap check rejects this fusion without extending any input lifetime.
+            if (fusion.id == GGML_METAL_FUSION_CONV_DW_BIAS_SILU) continue;
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
