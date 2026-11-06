@@ -46,6 +46,10 @@ static std::vector<dw_silu_case> dw_silu_cases() {
         cases.push_back({1024, 33, GGML_TYPE_F32, variant, false, false});
     }
     cases.push_back({1024, 33, GGML_TYPE_F32, "mapped_disjoint", true, false});
+    for (const char * variant : {"mapped_conv_bias_same", "mapped_partial_conv_bias_same",
+                                 "mapped_conv_bias_cross", "mapped_partial_conv_bias_cross"}) {
+        cases.push_back({1024, 33, GGML_TYPE_F32, variant, false, false});
+    }
     return cases;
 }
 
