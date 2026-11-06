@@ -105,6 +105,8 @@ static dw_silu_graph make_dw_silu_graph(ggml_context * ctx, const dw_silu_case &
         ggml_view_2d(ctx, g.bias_storage, columns, rows, g.bias_storage->nb[1], 0) :
         ggml_view_1d(ctx, g.bias_storage, columns, offset ? sizeof(float) : 0);
     g.sum = ggml_add(ctx, g.reshaped, g.bias);
+    ggml_tensor * activation_storage = variant == "strided_output" ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns + 4, rows) : nullptr;
     g.activation = variant == "inplace_output" ? ggml_silu_inplace(ctx, g.sum) :
                    variant == "relu" ? ggml_relu(ctx, g.sum) : ggml_silu(ctx, g.sum);
     if (variant == "input_alias" || variant == "partial_input_alias") {
@@ -117,7 +119,7 @@ static dw_silu_graph make_dw_silu_graph(ggml_context * ctx, const dw_silu_case &
         g.activation->view_src = g.bias_storage;
         g.activation->view_offs = 0;
     } else if (variant == "strided_output") {
-        g.activation->view_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns + 4, rows);
+        g.activation->view_src = activation_storage;
         g.activation->view_offs = 0;
         g.activation->nb[1] = (columns + 4)*sizeof(float);
         g.activation->nb[2] = g.activation->nb[3] = rows*g.activation->nb[1];
