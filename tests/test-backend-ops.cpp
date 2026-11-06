@@ -34,6 +34,7 @@
 #include <future>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -6336,6 +6337,114 @@ struct test_soft_max : public test_case {
     }
 };
 
+// Relative-position attention keeps the two products separate and adds the shifted view before scaling.
+struct test_add_soft_max_relpos : public test_case {
+    const int64_t t;
+    const int64_t heads;
+    const bool extreme;
+    const std::string variant;
+    int generation = 0;
+    ggml_tensor * ac = nullptr;
+    ggml_tensor * bd = nullptr;
+    ggml_tensor * scores = nullptr;
+    ggml_tensor * probabilities = nullptr;
+
+    test_add_soft_max_relpos(int64_t t, int64_t heads, bool extreme = false, std::string variant = "relative")
+        : t(t), heads(heads), extreme(extreme), variant(std::move(variant)) {}
+
+    std::string op_desc(ggml_tensor *) override { return "ADD_SOFT_MAX_RELPOS"; }
+    std::string vars() override { return VARS_TO_STR4(t, heads, extreme, variant); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    bool expects_fusion() const { return variant == "relative" || variant == "consumer"; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return variant == "output" ? std::vector<ggml_tensor *>{scores, probabilities}
+                                   : std::vector<ggml_tensor *>{};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = variant == "f16" ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const int64_t rows = variant == "rectangular" ? t + 1 : t;
+        ac = ggml_new_tensor_3d(ctx, type, variant == "padded_ac" ? t + 3 : t, rows, heads);
+        bd = ggml_new_tensor_3d(ctx, type, 2*t - 1, rows, heads);
+        ggml_set_name(ac, "ac");
+        ggml_set_name(bd, "bd");
+        ggml_tensor * a = ac;
+        if (variant == "padded_ac") {
+            a = ggml_view_3d(ctx, ac, t, rows, heads, ac->nb[1], ac->nb[2], sizeof(float));
+        }
+        ggml_tensor * b = ggml_view_3d(ctx, bd, t, rows, heads,
+            (2*t - 2)*ggml_type_size(type), bd->nb[2], (t - 1)*ggml_type_size(type));
+        if (variant == "contiguous") {
+            b = ggml_cont(ctx, b);
+        } else if (variant == "broadcast") {
+            b = ggml_view_3d(ctx, bd, t, 1, 1, bd->nb[1], bd->nb[2], 0);
+        } else if (variant == "wrong_stride") {
+            b = ggml_view_3d(ctx, bd, t, rows, heads, bd->nb[1], bd->nb[2], 0);
+        }
+        scores = variant == "swapped" ? ggml_add(ctx, b, a) : ggml_add(ctx, a, b);
+        ggml_set_name(scores, "scores");
+        if (variant == "output") {
+            ggml_set_output(scores);
+        }
+        ggml_tensor * input = type == GGML_TYPE_F16 ? ggml_cast(ctx, scores, GGML_TYPE_F32) : scores;
+        ggml_tensor * mask = variant == "mask" ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, rows) : nullptr;
+        const float scale = 1.0f / std::sqrt(128.0f);
+        probabilities = variant == "inplace" ? ggml_soft_max_ext_inplace(ctx, input, mask, scale, 0.0f)
+                                             : ggml_soft_max_ext(ctx, input, mask, scale, 0.0f);
+        if (variant == "sinks") {
+            ggml_soft_max_add_sinks(probabilities, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads));
+        }
+        ggml_set_name(probabilities, "probabilities");
+        ggml_tensor * out = probabilities;
+        if (variant == "reuse") {
+            out = ggml_add(ctx, probabilities, scores);
+        } else if (variant == "consumer") {
+            out = ggml_add(ctx, probabilities, ac);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor : {ac, bd}) {
+            std::vector<float> data(ggml_nelements(tensor));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const int64_t row = i / tensor->ne[0];
+                const int64_t col = i % tensor->ne[0];
+                const int64_t key = 17*col + 29*row + 13*generation + (tensor == ac ? 7 : 19);
+                data[i] = (float) (key % 127 - 63) * (tensor == ac ? 0.1234567f : 0.07654321f);
+                if (extreme) {
+                    data[i] += (key % 3 == 0 ? 10000.0f : -10000.0f);
+                }
+            }
+            if (tensor->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> half(data.size());
+                ggml_fp32_to_fp16_row(data.data(), half.data(), (int64_t) data.size());
+                ggml_backend_tensor_set(tensor, half.data(), 0, half.size()*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
+static std::vector<std::unique_ptr<test_add_soft_max_relpos>> make_add_soft_max_relpos_cases() {
+    std::vector<std::unique_ptr<test_add_soft_max_relpos>> cases;
+    for (int64_t t : {1, 31, 32, 33, 171, 172, 375}) {
+        for (bool extreme : {false, true}) {
+            cases.emplace_back(new test_add_soft_max_relpos(t, 8, extreme));
+        }
+    }
+    for (const char * variant : {"contiguous", "broadcast", "wrong_stride", "padded_ac", "swapped",
+                                "rectangular", "f16", "mask", "sinks", "inplace", "output", "reuse", "consumer"}) {
+        cases.emplace_back(new test_add_soft_max_relpos(32, 3, false, variant));
+    }
+    return cases;
+}
+
 // GGML_OP_SOFT_MAX_BACK
 struct test_soft_max_back : public test_case {
     const ggml_type type;
@@ -11482,6 +11591,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         exponent <<= 1;
     }
 #endif
+    for (auto & test : make_add_soft_max_relpos_cases()) {
+        test_cases.emplace_back(std::move(test));
+    }
+
     for (bool mask : {false, true}) {
         for (bool sinks : {false, true}) {
             for (float max_bias : {0.0f, 8.0f}) {
@@ -12998,6 +13111,118 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// The switch is process-wide, so the exact Metal comparison runs after the parallel CPU-reference cases.
+static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * op_names_filter) {
+#if defined(__APPLE__)
+    if (!op_names_filter_selects(op_names_filter, "ADD_SOFT_MAX_RELPOS")) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using get_t = void * (*)(ggml_backend_dev_t);
+    using init_t = void (*)(void *);
+    using stats_t = int (*)(void *, const char **, uint64_t *, int);
+    using token_t = const char * (*)(ggml_backend_dev_t);
+    auto get = (get_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
+    auto init = (init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
+    auto reset = (init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_reset");
+    auto stats = (stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
+    auto token = (token_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_tuning_device_token");
+    if (!get || !init || !reset || !stats || !token || strcmp(token(dev), "GGML_METAL_DEVICE_M2_ULTRA") != 0) {
+        return true;
+    }
+    void * finfo = get(dev);
+    init(finfo);
+    ggml_backend_ptr exact_backend(ggml_backend_dev_init(dev, nullptr));
+    if (!exact_backend) {
+        return false;
+    }
+    const char * previous = getenv("GGML_METAL_ADD_SOFTMAX");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    bool ok = true;
+    int n_run = 0;
+    for (auto & tc : make_add_soft_max_relpos_cases()) {
+        tc->mode = MODE_TEST;
+        ggml_init_params params = { ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(256, false), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 256, false);
+        ggml_tensor * out = tc->build_graph(ctx.get());
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), exact_backend.get()));
+        if (!buffer) {
+            ok = false;
+            break;
+        }
+        std::vector<ggml_tensor *> checked = tc->fusion_test_nodes();
+        checked.push_back(out);
+        for (tc->generation = 0; tc->generation < 2; ++tc->generation) {
+            tc->initialize_tensors(ctx.get());
+            std::vector<uint8_t> reference;
+            for (bool enabled : {false, true}) {
+                setenv("GGML_METAL_ADD_SOFTMAX", enabled ? "1" : "0", 1);
+                for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                    if (tensor->op == GGML_OP_NONE || tensor->view_src) {
+                        continue;
+                    }
+                    std::vector<float> poison(ggml_nelements(tensor), std::numeric_limits<float>::quiet_NaN());
+                    if (tensor->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_set(tensor, poison.data(), 0, poison.size()*sizeof(float));
+                    } else if (tensor->type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> half(poison.size());
+                        ggml_fp32_to_fp16_row(poison.data(), half.data(), (int64_t) poison.size());
+                        ggml_backend_tensor_set(tensor, half.data(), 0, half.size()*sizeof(ggml_fp16_t));
+                    }
+                }
+                reset(finfo);
+                bool same = ggml_backend_graph_compute(exact_backend.get(), graph) == GGML_STATUS_SUCCESS;
+                const int n = stats(finfo, nullptr, nullptr, 0);
+                std::vector<const char *> labels(n);
+                std::vector<uint64_t> counts(n);
+                stats(finfo, labels.data(), counts.data(), n);
+                uint64_t fused = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (strcmp(labels[i], "ADD+SOFT_MAX") == 0) {
+                        fused += counts[i];
+                    }
+                }
+                same = same && fused == (enabled && tc->expects_fusion() ? 1u : 0u);
+                std::vector<uint8_t> actual;
+                for (ggml_tensor * tensor : checked) {
+                    const std::vector<float> values = tensor_to_float(tensor);
+                    same = same && std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+                    const size_t offset = actual.size();
+                    actual.resize(offset + ggml_nbytes(tensor));
+                    ggml_backend_tensor_get(tensor, actual.data() + offset, 0, ggml_nbytes(tensor));
+                }
+                if (enabled) {
+                    same = same && actual == reference;
+                } else {
+                    reference = actual;
+                }
+                if (!same) {
+                    printf("  FAIL ADD_SOFT_MAX_RELPOS exact (%s,generation=%d,enabled=%d,fused=%llu)\n",
+                           tc->vars().c_str(), tc->generation, (int) enabled, (unsigned long long) fused);
+                    ok = false;
+                }
+                ++n_run;
+            }
+        }
+    }
+    if (had_previous) {
+        setenv("GGML_METAL_ADD_SOFTMAX", saved.c_str(), 1);
+    } else {
+        unsetenv("GGML_METAL_ADD_SOFTMAX");
+    }
+    printf("  ADD_SOFT_MAX_RELPOS exact: %d poisoned executions, %s\n", n_run, ok ? "OK" : "FAIL");
+    return ok;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(op_names_filter);
+    return true;
+#endif
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -13137,7 +13362,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        const bool relpos_ok = run_add_soft_max_relpos_exact(backend, op_names_filter);
+        return n_ok == tests_run && slice_ok && relpos_ok;
     }
 
     if (mode == MODE_GRAD) {
