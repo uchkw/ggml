@@ -386,6 +386,8 @@ typedef struct {
     uint64_t nb31;
     uint64_t nb32;
     uint64_t nb33;
+    uint64_t row_size1;
+    uint64_t row_size2;
 } ggml_metal_kargs_flash_attn_ext_pad;
 
 typedef struct {

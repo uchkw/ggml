@@ -82,21 +82,11 @@ kernel void kernel_flash_attn_ext_pad(
         device char * k_dst = k_pad + args.nb11*i1 + args.nb11*C*i2 + args.nb11*C*args.ne_12_2*i3;
         device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
 
-        if (i1 >= icp) {
-            // here it is not important the exact value that will be used as we rely on masking out the scores in the attention
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
-                k_dst[i] = 0;
-            }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
-                v_dst[i] = 0;
-            }
-        } else {
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
-                k_dst[i] = k_src[i];
-            }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
-                v_dst[i] = v_src[i];
-            }
+        for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+            k_dst[i] = (i1 < icp && i < args.row_size1) ? k_src[i] : 0;
+        }
+        for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+            v_dst[i] = (i1 < icp && i < args.row_size2) ? v_src[i] : 0;
         }
     }
 
