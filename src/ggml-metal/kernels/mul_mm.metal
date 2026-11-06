@@ -173,6 +173,8 @@ kernel void kernel_mul_mm(
 
 #else
 
+constant bool FC_mul_mm_silu [[function_constant(FC_MUL_MM + 9)]];
+
 template<
     typename S0, typename S0_4x4, typename S0_8x8,
     typename S1, typename S1_2x4, typename S1_8x8,
@@ -342,6 +344,15 @@ kernel void kernel_mul_mm(
 
             lsma += 8*64;
             lsmb += 4*64;
+        }
+    }
+
+    if (FC_mul_mm_silu) {
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short j = 0; j < 2; ++j) {
+                const float x = mc[i].thread_elements()[j];
+                mc[i].thread_elements()[j] = x / (1 + exp(-x));
+            }
         }
     }
 

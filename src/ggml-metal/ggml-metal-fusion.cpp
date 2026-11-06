@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -707,6 +708,54 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+static bool ggml_metal_mm_silu_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_METAL_MM_SILU");
+        if (value == nullptr || std::strcmp(value, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(value, "1") == 0) {
+            return true;
+        }
+        GGML_ABORT("GGML_METAL_MM_SILU must be 0 or 1");
+    }();
+    return enabled;
+}
+
+static bool ggml_metal_fusion_check_mul_mat_silu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * mm   = nodes[0];
+    const ggml_tensor * silu = nodes[1];
+    const ggml_type type = mm->src[0]->type;
+
+    if (!ggml_metal_mm_silu_enabled() || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        (type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_K) ||
+        mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
+        mm->src[0]->ne[0] != 1024 || mm->ne[0] != 4096 || mm->ne[1] <= 16) {
+        return false;
+    }
+
+    const ggml_tensor * tensors[] = {mm->src[0], mm->src[1], mm, silu};
+    for (const ggml_tensor * t : tensors) {
+        if (!ggml_is_contiguous(t) || !ggml_is_matrix(t)) {
+            return false;
+        }
+    }
+
+    return mode == GGML_METAL_FUSION_STRUCTURAL ||
+        (!ggml_metal_fusion_overlap(silu, mm->src[0]) && !ggml_metal_fusion_overlap(silu, mm->src[1]));
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -757,6 +806,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_mat_silu = { GGML_OP_MUL_MAT, GGML_OP_UNARY };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -786,6 +836,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MAT_SILU,   ops_mul_mat_silu,           {},     false, ggml_metal_fusion_check_mul_mat_silu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1074,6 +1125,7 @@ static bool ggml_metal_fusion_check_memory_ranges(
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
 const ggml_metal_fusion * ggml_metal_fusion_next(
+        const ggml_metal_device_props * props,
         const ggml_cgraph * gf,
         const int * node_idxs,
         int n_idxs,
@@ -1084,6 +1136,9 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     int best = 1;
 
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == GGML_METAL_FUSION_MUL_MAT_SILU && (!props->has_simdgroup_mm || props->has_tensor)) {
+            continue;
+        }
         const int n_ops = (int) fusion.ops.size();
 
         // only look for a longer match than the current best
@@ -1168,7 +1223,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
 // span from idx to the last matched node (intermediate views are packed along).
-int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+int ggml_metal_fusion_max(const ggml_metal_device_props * props, const ggml_cgraph * gf, int idx) {
     // a view node cannot start a pattern - pack it alone
     if (ggml_op_is_empty(gf->nodes[idx]->op)) {
         return 1;
@@ -1192,7 +1247,7 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
     while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
         int len = 1;
-        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
+        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(props, gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
             break;
         }
