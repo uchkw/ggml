@@ -887,6 +887,10 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // This epilogue rejects overlapping inputs after allocation instead of extending their lifetimes.
+            if (fusion.id == GGML_METAL_FUSION_MUL_MAT_SILU) {
+                continue;
+            }
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
