@@ -152,5 +152,6 @@ static void initialize_dw_silu_graph(const dw_silu_graph & g, const dw_silu_case
     initialize_dw_silu_tensor(g.weight_storage, 362436069u, variant == "wide" ? 0.00000005f :
                              variant == "signed" ? 0.5f : 0.0005f,
                              variant == "wide" ? 0.00000015f : variant == "signed" ? 0.0f : 0.0015f);
-    initialize_dw_silu_tensor(g.bias_storage, 521288629u, 0.125f, 0.375f);
+    // Mapped partial aliases also need every neighboring bias to exceed every expected activation.
+    initialize_dw_silu_tensor(g.bias_storage, 521288629u, variant.find("mapped_") == 0 ? 0.03125f : 0.125f, 0.375f);
 }
