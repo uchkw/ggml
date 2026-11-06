@@ -788,7 +788,9 @@ static bool ggml_metal_fusion_check_conv_dw_bias_silu(
     const int output = first + 4;
     if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 5, fusion->ops_all.data(), &output, 1)) return false;
     if (mode == GGML_METAL_FUSION_FULL) {
-        if (!dst->data || !input->data || !kernel->data || !bias->data) return false;
+        if (!conv->data || !dst->data || !input->data || !kernel->data || !bias->data) return false;
+        // Eliding the convolution store must not change the bias that the following ADD reads.
+        if (ggml_metal_dw_silu_overlaps(conv, bias)) return false;
         // Even an exact input alias races across neighboring convolution positions.
         if (ggml_metal_dw_silu_overlaps(dst, input) || ggml_metal_dw_silu_overlaps(dst, kernel) ||
             ggml_metal_dw_silu_overlaps(dst, bias)) return false;
