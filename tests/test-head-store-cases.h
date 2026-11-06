@@ -86,6 +86,12 @@ static head_store_graph make_head_store_graph(ggml_context * ctx, const head_sto
     if (variant == "no_cont") {
         g.out = g.perm;
     } else {
+        ggml_tensor * cont_storage = nullptr;
+        if (variant == "offset") {
+            cont_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(g.perm) + 8);
+        } else if (variant == "strided_cont") {
+            cont_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d + 4, h, c.frames, batch);
+        }
         g.cont = ggml_cont(ctx, g.perm);
         if (variant == "alias_a" || variant == "partial_alias_a") {
             g.cont->view_src = g.a_storage;
@@ -94,10 +100,10 @@ static head_store_graph make_head_store_graph(ggml_context * ctx, const head_sto
             g.cont->view_src = g.b_storage;
             g.cont->view_offs = variant == "alias_b" ? 0 : 4*sizeof(float);
         } else if (variant == "offset") {
-            g.cont->view_src = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(g.cont) + 8);
+            g.cont->view_src = cont_storage;
             g.cont->view_offs = offset;
         } else if (variant == "strided_cont") {
-            g.cont->view_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d + 4, h, c.frames, batch);
+            g.cont->view_src = cont_storage;
             g.cont->view_offs = 0;
             g.cont->nb[1] = (d + 4)*sizeof(float);
             g.cont->nb[2] = g.cont->nb[1]*h;
