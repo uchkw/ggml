@@ -168,6 +168,18 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+if (APPLE AND GGML_METAL AND NOT GGML_BACKEND_DL)
+    set(TEST_TARGET test-metal-bindings)
+    # the .m sources of the Metal backend also compile under the C rule, with the compiler
+    # reading Objective-C from the file extension, since nothing enables the OBJC language
+    set_source_files_properties(${TEST_TARGET}.m PROPERTIES LANGUAGE C)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.m)
+    target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-metal)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-metal "-framework Foundation" "-framework Metal")
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+endif()
+
 
 if (NOT GGML_BACKEND_DL)
     #

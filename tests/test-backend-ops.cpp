@@ -3970,6 +3970,48 @@ struct test_add_add : public test_case {
     }
 };
 
+// Repeated dispatches keep input bindings while views and scalar argument bytes change.
+struct test_metal_bindings : public test_case {
+    const int64_t width;
+    const int64_t frames;
+    const int steps;
+    const bool views;
+    const bool alternate;
+
+    test_metal_bindings(int64_t width, int64_t frames, int steps, bool views, bool alternate)
+        : width(width), frames(frames), steps(steps), views(views), alternate(alternate) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "METAL_BINDINGS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(width, frames, steps, views, alternate);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, frames + 2);
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, frames + 2);
+        ggml_set_name(a, "binding_a");
+        ggml_set_name(b, "binding_b");
+        auto * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, frames);
+        for (int i = 0; i < steps; ++i) {
+            auto * base = alternate && (i % 2) ? b : a;
+            const size_t offset = views ? (i % 3)*base->nb[1] : 0;
+            auto * input = ggml_view_2d(ctx, base, width, frames, base->nb[1], offset);
+            out = ggml_add(ctx, out, input);
+            ggml_set_output(out);
+            out = ggml_scale(ctx, out, 1.0f/(2 + i % 3));
+            ggml_set_output(out);
+        }
+        ggml_set_name(out, "binding_output");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -9789,6 +9831,22 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Repeated ADD and scale dispatches whose leaf inputs are views at reused or alternating
+    // offsets, on graphs short enough for the eval harness's budget of 128 tensor objects
+    // (each step costs a view and two results) and long enough (101 nodes) to cross the 64
+    // nodes that ggml_metal_graph_compute gives the first encoder before partitioning the rest.
+    for (int64_t width : {32, 1024}) {
+        for (int64_t frames : {1, 33, 171}) {
+            for (int steps : {3, 32}) {
+                for (bool views : {false, true}) {
+                    for (bool alternate : {false, true}) {
+                        test_cases.emplace_back(new test_metal_bindings(width, frames, steps, views, alternate));
+                    }
+                }
+            }
+        }
+    }
 
     // outputs of 64 modulo 128 columns, past which Metal's tensor-API kernel_mul_mm stored its last tile
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 64, 256, {1, 1}, {1, 1}));
