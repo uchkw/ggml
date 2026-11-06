@@ -20,7 +20,7 @@ static std::vector<mm_silu_case> mm_silu_cases() {
         for (const char * variant : {"offset", "inplace", "consumer"}) {
             cases.push_back({type, 4096, 33, 1024, variant, true});
         }
-        for (const char * variant : {"reuse", "output", "stride", "transpose", "batch", "relu"}) {
+        for (const char * variant : {"reuse", "output", "stride", "transpose", "batch", "relu", "alias"}) {
             cases.push_back({type, 4096, 33, 1024, variant, false});
         }
         for (int64_t n : {1, 8, 16}) cases.push_back({type, 4096, n, 1024, "plain", false});
