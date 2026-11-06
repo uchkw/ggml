@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -718,6 +719,21 @@ static bool ggml_metal_dw_silu_enabled() {
     return enabled;
 }
 
+/** Shared wrappers can map overlapping host ranges with distinct Metal buffer identities. */
+static bool ggml_metal_dw_silu_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    if (ggml_metal_fusion_overlap(a, b)) return true;
+
+    const auto ba = a->view_src ? a->view_src->buffer : a->buffer;
+    const auto bb = b->view_src ? b->view_src->buffer : b->buffer;
+    if (!ggml_metal_buffer_is_shared((ggml_metal_buffer_t) ba->context) ||
+        !ggml_metal_buffer_is_shared((ggml_metal_buffer_t) bb->context)) return false;
+
+    // Private buffers use synthetic addresses, which cannot be compared with host pointers.
+    const auto first = reinterpret_cast<uintptr_t>(a->data);
+    const auto second = reinterpret_cast<uintptr_t>(b->data);
+    return first <= second ? second - first < ggml_nbytes(a) : first - second < ggml_nbytes(b);
+}
+
 static bool ggml_metal_fusion_check_conv_dw_bias_silu(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -774,8 +790,8 @@ static bool ggml_metal_fusion_check_conv_dw_bias_silu(
     if (mode == GGML_METAL_FUSION_FULL) {
         if (!dst->data || !input->data || !kernel->data || !bias->data) return false;
         // Even an exact input alias races across neighboring convolution positions.
-        if (ggml_metal_fusion_overlap(dst, input) || ggml_metal_fusion_overlap(dst, kernel) ||
-            ggml_metal_fusion_overlap(dst, bias)) return false;
+        if (ggml_metal_dw_silu_overlaps(dst, input) || ggml_metal_dw_silu_overlaps(dst, kernel) ||
+            ggml_metal_dw_silu_overlaps(dst, bias)) return false;
     }
     return true;
 }
