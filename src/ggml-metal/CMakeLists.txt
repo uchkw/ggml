@@ -4,6 +4,12 @@ find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
 
 message(STATUS "Metal framework found")
 
+# diagnostic builds only: compiles the per-encoder buffer binding trace into
+# ggml-metal-device.m; the default OFF build contains no trace code
+if (GGML_METAL_BIND_CACHE_TRACE)
+    add_compile_definitions(GGML_METAL_BIND_CACHE_TRACE)
+endif()
+
 ggml_add_backend_library(ggml-metal
                          ggml-metal.cpp
                          ggml-metal-device.m

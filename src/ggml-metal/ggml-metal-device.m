@@ -12,6 +12,8 @@
 
 #include <stdatomic.h>
 
+#include <pthread.h>
+
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
@@ -829,12 +831,79 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 // MTLComputeCommandEncoder wrapper
 //
 
-struct ggml_metal_encoder {
-    id<MTLComputeCommandEncoder> obj;
+// ordinary compute buffer arguments per the Metal feature set tables: slots 0..30
+#define GGML_METAL_BIND_CACHE_SLOTS 31
+
+// trial 033: last known non-null buffer binding of one argument slot. `buf`
+// holds the exact MTLBuffer object identity (never its host storage and never
+// the tensor) and is not retained - the cache is non-owning and changes none
+// of the existing resource ownership or lifetimes. The production command
+// buffers come from commandBufferWithUnretainedReferences
+// (ggml-metal-context.m), so the existing owners keep the bound buffers alive
+// through GPU completion, not merely the host-side encoding, exactly as the
+// direct setters already require; the cache dies with its encoder
+struct ggml_metal_bind_slot {
+    void * buf;
+    size_t offs;
+    bool known;
 };
 
+#if GGML_METAL_BIND_CACHE_TRACE
+// encoder-local diagnostic counters for trace builds only; there is no global,
+// atomic or per-process state behind them
+struct ggml_metal_bind_trace {
+    uint32_t req;   // set_buffer wrapper calls
+    uint32_t full;  // full setBuffer:offset:atIndex: calls made (nil bindings included)
+    uint32_t offs;  // setBufferOffset:atIndex: calls made
+    uint32_t skip;  // redundant same-object same-offset bindings omitted
+    uint32_t nil;   // nil bindings made (subset of full)
+    uint32_t bytes; // setBytes calls made
+    uint32_t inval; // setBytes calls that dropped a known cached binding
+    uint32_t pipe;  // setComputePipelineState calls made
+    uint32_t disp;  // dispatches encoded
+    uint32_t bar;   // memory barriers encoded
+};
+#endif
+
+struct ggml_metal_encoder {
+    id<MTLComputeCommandEncoder> obj;
+
+    // snapshot of GGML_METAL_BIND_CACHE taken when this wrapper is created;
+    // the cache itself is zeroed by calloc, so every fresh wrapper starts empty
+    bool bind_cache;
+    struct ggml_metal_bind_slot bind[GGML_METAL_BIND_CACHE_SLOTS];
+
+#if GGML_METAL_BIND_CACHE_TRACE
+    struct ggml_metal_bind_trace trace;
+#endif
+};
+
+// process-wide choice read at most once, before the first encoder is created
+static bool ggml_metal_encoder_bind_cache = false;
+static pthread_once_t ggml_metal_encoder_bind_cache_once = PTHREAD_ONCE_INIT;
+
+// strict GGML_METAL_BIND_CACHE parse: unset and "0" disable the cache, "1"
+// enables it, every other value aborts the process
+static void ggml_metal_encoder_bind_cache_init(void) {
+    const char * val = getenv("GGML_METAL_BIND_CACHE");
+
+    if (val == NULL || strcmp(val, "0") == 0) {
+        ggml_metal_encoder_bind_cache = false;
+    } else if (strcmp(val, "1") == 0) {
+        ggml_metal_encoder_bind_cache = true;
+
+        GGML_LOG_INFO("%s: GGML_METAL_BIND_CACHE = 1 - buffer binding cache enabled\n", __func__);
+    } else {
+        GGML_ABORT("%s: invalid GGML_METAL_BIND_CACHE = '%s' (expected unset, 0 or 1)\n", __func__, val);
+    }
+}
+
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+    pthread_once(&ggml_metal_encoder_bind_cache_once, ggml_metal_encoder_bind_cache_init);
+
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    res->bind_cache = ggml_metal_encoder_bind_cache;
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
@@ -869,15 +938,104 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
 
+    // always forwarded: a pipeline change never invalidates cached buffer bindings
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.pipe++;
+#endif
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    // bytes arguments are never cached and always forwarded; when the cache is
+    // on, the same argument slot's cached buffer binding is dropped
+    if (encoder->bind_cache && (idx < 0 || idx >= GGML_METAL_BIND_CACHE_SLOTS)) {
+        GGML_ABORT("%s: buffer argument index %d outside the ordinary compute buffer slots 0..%d\n",
+                   __func__, idx, GGML_METAL_BIND_CACHE_SLOTS - 1);
+    }
+
     [encoder->obj setBytes:data length:size atIndex:idx];
+
+    if (encoder->bind_cache) {
+        struct ggml_metal_bind_slot * slot = &encoder->bind[idx];
+
+#if GGML_METAL_BIND_CACHE_TRACE
+        if (slot->known) {
+            encoder->trace.inval++;
+        }
+#endif
+        slot->known = false;
+        slot->buf   = NULL;
+        slot->offs  = 0;
+    }
+
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.bytes++;
+#endif
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.req++;
+#endif
+
+    if (!encoder->bind_cache) {
+        [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+#if GGML_METAL_BIND_CACHE_TRACE
+        encoder->trace.full++;
+        if (buffer.metal == nil) {
+            encoder->trace.nil++;
+        }
+#endif
+        return;
+    }
+
+    if (idx < 0 || idx >= GGML_METAL_BIND_CACHE_SLOTS) {
+        GGML_ABORT("%s: buffer argument index %d outside the ordinary compute buffer slots 0..%d\n",
+                   __func__, idx, GGML_METAL_BIND_CACHE_SLOTS - 1);
+    }
+
+    struct ggml_metal_bind_slot * slot = &encoder->bind[idx];
+
+    if (buffer.metal == nil) {
+        // a nil binding is always forwarded as-is and always invalidates the slot
+        [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+
+        slot->known = false;
+        slot->buf   = NULL;
+        slot->offs  = 0;
+#if GGML_METAL_BIND_CACHE_TRACE
+        encoder->trace.full++;
+        encoder->trace.nil++;
+#endif
+        return;
+    }
+
+    if (slot->known && slot->buf == buffer.metal) {
+        if (slot->offs == buffer.offs) {
+            // same object at the same offset is already bound: omit the call
+#if GGML_METAL_BIND_CACHE_TRACE
+            encoder->trace.skip++;
+#endif
+            return;
+        }
+
+        [encoder->obj setBufferOffset:buffer.offs atIndex:idx];
+
+        slot->offs = buffer.offs;
+#if GGML_METAL_BIND_CACHE_TRACE
+        encoder->trace.offs++;
+#endif
+        return;
+    }
+
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+
+    slot->known = true;
+    slot->buf   = buffer.metal;
+    slot->offs  = buffer.offs;
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.full++;
+#endif
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
@@ -889,14 +1047,37 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.disp++;
+#endif
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+#if GGML_METAL_BIND_CACHE_TRACE
+    encoder->trace.bar++;
+#endif
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
+#if GGML_METAL_BIND_CACHE_TRACE
+    // one parseable row per encoder end; req == full + offs + skip must hold
+    // (nil is the reported subset of full). Counts only - no timing.
+    GGML_LOG_INFO("%s: bind_cache_trace cache=%d req=%u full=%u offs=%u skip=%u nil=%u bytes=%u inval=%u pipe=%u disp=%u bar=%u\n",
+                  __func__,
+                  encoder->bind_cache ? 1 : 0,
+                  encoder->trace.req,
+                  encoder->trace.full,
+                  encoder->trace.offs,
+                  encoder->trace.skip,
+                  encoder->trace.nil,
+                  encoder->trace.bytes,
+                  encoder->trace.inval,
+                  encoder->trace.pipe,
+                  encoder->trace.disp,
+                  encoder->trace.bar);
+#endif
 }
 
 struct ggml_metal_device {

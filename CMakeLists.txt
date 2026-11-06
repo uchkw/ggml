@@ -245,6 +245,7 @@ set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
 set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
                                             "ggml: metal -mtargetos OS name (macos, ios, xros, tvos)")
+option(GGML_METAL_BIND_CACHE_TRACE         "ggml: trace Metal buffer binding cache counters per encoder (diagnostic builds only, never primary)" OFF)
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
