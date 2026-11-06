@@ -3757,7 +3757,7 @@ struct test_residual_norm : public test_case {
         if (variant == "output_residual") ggml_set_output(residual);
         if (variant == "output_norm") ggml_set_output(norm);
         if (variant == "output_mul") ggml_set_output(mul);
-        if (variant == "partial_a") {
+        if (variant == "partial_a" || variant == "partial_residual") {
             alias_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(a) + 4);
         }
         if (variant == "reuse_residual") return ggml_add(ctx, affine, residual);
@@ -3817,7 +3817,7 @@ static std::vector<std::unique_ptr<test_residual_norm>> make_residual_norm_cases
     }
     for (const char * variant : {"width", "strided", "broadcast", "row_weight", "f16", "output_residual",
                                 "output_norm", "output_mul", "reuse_residual", "reuse_norm", "reuse_mul",
-                                "partial_a", "wrapper_a", "wrapper_weight"}) {
+                                "partial_a", "partial_residual", "wrapper_a", "wrapper_weight"}) {
         cases.emplace_back(new test_residual_norm(33, 0, variant));
     }
     return cases;
@@ -13224,8 +13224,9 @@ static bool run_residual_norm_exact(ggml_backend_t backend, const char * op_name
         const bool aliases_input = tc->variant == "alias_a" || tc->variant == "alias_b" ||
                                    tc->variant == "partial_a" || tc->variant == "wrapper_a";
         if (tc->alias_storage) {
-            tc->a->data = tc->alias_storage->data;
-            out->data = (char *) tc->a->data + 4*sizeof(float);
+            ggml_tensor * input = tc->variant == "partial_a" ? tc->a : tc->residual;
+            input->data = tc->alias_storage->data;
+            out->data = (char *) input->data + 4*sizeof(float);
         } else if (tc->variant == "alias_a") {
             out->data = tc->a->data;
         } else if (tc->variant == "alias_b") {
