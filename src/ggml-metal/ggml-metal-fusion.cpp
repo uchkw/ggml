@@ -742,6 +742,9 @@ static bool ggml_metal_fusion_check_conformer_glu(
         if (tensor->type != GGML_TYPE_F32 || !ggml_are_same_shape(tensor, unary) || !ggml_is_contiguous(tensor)) return false;
     }
     if (mode == GGML_METAL_FUSION_FULL) {
+        // Separate Metal mappings can alias host memory outside the same-buffer overlap checks.
+        if (!ggml_metal_fusion_same_buffer(gate, a) || !ggml_metal_fusion_same_buffer(gate, unary) ||
+            !ggml_metal_fusion_same_buffer(gate, mul)) return false;
         // Each lane loads both original operands before its store; only an exact in-place range is safe.
         for (const auto * input : {gate, a}) {
             if (mul->data != input->data && ggml_metal_fusion_overlap(mul, input)) return false;
