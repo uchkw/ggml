@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -44,6 +45,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <utility>
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -3697,6 +3699,80 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+// A single-row affine LayerNorm and the dependencies that prevent dispatcher fusion.
+struct test_norm_mul_add_row : public test_case {
+    const int64_t width;
+    const int64_t rows;
+    const std::string variant;
+    std::vector<ggml_tensor *> verified;
+
+    test_norm_mul_add_row(int64_t width, int64_t rows = 1, std::string variant = "plain")
+        : width(width), rows(rows), variant(std::move(variant)) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_MUL_ADD_ROW";
+    }
+
+    std::string vars() override { return VARS_TO_STR3(width, rows, variant); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verified; }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU
+            ? 0.0 : test_case::max_nmse_err(backend);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (std::memcmp(a, b, n * sizeof(float)) == 0) {
+            return 0.0;
+        }
+        // A signed-zero change still fails the CPU's exact comparison.
+        return std::max(test_case::err(a, b, n), std::numeric_limits<double>::min());
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verified.clear();
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        if (variant == "input_view") {
+            a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width + 3);
+            a = ggml_view_1d(ctx, a, width, 3 * sizeof(float));
+        } else if (variant == "strided_input") {
+            a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * width + 1);
+            a = ggml_transpose(ctx, ggml_view_2d(ctx, a, 1, width, 2 * sizeof(float), sizeof(float)));
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, variant == "scalar_bias" ? 1 : width);
+        if (variant == "shared_input") {
+            w = a;
+            b = a;
+        }
+        ggml_set_name(a, "row_input");
+        ggml_set_name(w, "row_weight");
+        ggml_set_name(b, "row_bias");
+        ggml_tensor * n = variant == "norm_inplace" ? ggml_norm_inplace(ctx, a, 1e-5f) : ggml_norm(ctx, a, 1e-5f);
+        ggml_tensor * nm = variant == "norm_view" ? ggml_view_tensor(ctx, n) : n;
+        const bool swap_mul = variant == "swap_mul" || variant == "swap_both";
+        ggml_tensor * m = variant == "mul_inplace" ? ggml_mul_inplace(ctx, nm, w)
+            : swap_mul ? ggml_mul(ctx, w, nm) : ggml_mul(ctx, nm, w);
+        const bool swap_add = variant == "swap_add" || variant == "swap_both";
+        ggml_tensor * out = variant == "add_inplace" ? ggml_add_inplace(ctx, m, b)
+            : swap_add ? ggml_add(ctx, b, m) : ggml_add(ctx, m, b);
+        if (variant == "norm_output" || variant == "mul_output") {
+            ggml_tensor * retained = variant == "norm_output" ? n : m;
+            ggml_set_output(retained);
+            verified.push_back(retained);
+        } else if (variant == "norm_fanout") {
+            out = ggml_add(ctx, out, n);
+        } else if (variant == "mul_fanout") {
+            out = ggml_add(ctx, out, m);
+        }
+        ggml_set_name(out, "row_result");
+        verified.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -10765,6 +10841,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    for (int64_t width : {1, 639, 640, 641, 1025}) {
+        test_cases.emplace_back(new test_norm_mul_add_row(width));
+    }
+    for (const char * variant : {"swap_mul", "swap_add", "swap_both", "norm_output", "mul_output",
+                                 "norm_fanout", "mul_fanout", "norm_view", "norm_inplace", "mul_inplace",
+                                 "add_inplace", "input_view", "strided_input", "shared_input", "scalar_bias"}) {
+        test_cases.emplace_back(new test_norm_mul_add_row(640, 1, variant));
+    }
+    test_cases.emplace_back(new test_norm_mul_add_row(640, 2));
+
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
