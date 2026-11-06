@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "test-mm-silu-cases.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7741,6 +7742,59 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// A whole graph preserves the product's consumer and output flags while comparing the fused path with the CPU.
+struct test_mul_mat_silu : public test_case {
+    const mm_silu_case c;
+    ggml_tensor * mm = nullptr;
+    ggml_tensor * result = nullptr;
+
+    explicit test_mul_mat_silu(mm_silu_case c) : c(c) {}
+
+    std::string vars() override {
+        return "type_a=" + std::string(ggml_type_name(c.type)) + ",m=" + std::to_string(c.m) +
+               ",n=" + std::to_string(c.n) + ",k=" + std::to_string(c.k) + ",variant=" + c.variant;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return std::string(c.variant) == "output" ? std::vector<ggml_tensor *>{mm, result} :
+                                                  std::vector<ggml_tensor *>{result};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const std::string variant(c.variant);
+        const int64_t batch = variant == "batch" ? 2 : 1;
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, c.type, c.k, c.m + (variant == "offset"), batch);
+        ggml_tensor * b = variant == "transpose" ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n, c.k) :
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k + (variant == "stride" ? 4 : 0), c.n + (variant == "offset"), batch);
+        if (variant == "offset") {
+            a = ggml_view_2d(ctx, a, c.k, c.m, a->nb[1], a->nb[1]);
+            b = ggml_view_2d(ctx, b, c.k, c.n, b->nb[1], b->nb[1]);
+        } else if (variant == "stride") {
+            b = ggml_view_2d(ctx, b, c.k, c.n, b->nb[1], 0);
+        } else if (variant == "transpose") {
+            b = ggml_transpose(ctx, b);
+        }
+        mm = ggml_mul_mat(ctx, a, b);
+        ggml_prec_set_acc(mm, GGML_PREC_F32);
+        ggml_set_name(mm, "product");
+        if (variant == "output") ggml_set_output(mm);
+        result = variant == "inplace" ? ggml_silu_inplace(ctx, mm) :
+                 variant == "relu" ? ggml_relu(ctx, mm) : ggml_silu(ctx, mm);
+        if (variant == "reuse") result = ggml_add(ctx, result, mm);
+        if (variant == "consumer") result = ggml_scale(ctx, result, 0.5f);
+        ggml_set_name(result, "out");
+        return result;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11017,6 +11071,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+
+    for (const mm_silu_case & c : mm_silu_cases()) {
+        test_cases.emplace_back(new test_mul_mat_silu(c));
+    }
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
