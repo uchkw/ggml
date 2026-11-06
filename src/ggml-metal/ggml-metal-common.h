@@ -13,6 +13,7 @@ extern "C" {
 
 struct ggml_tensor;
 struct ggml_cgraph;
+struct ggml_metal_device_props;
 
 enum ggml_mem_range_type {
     MEM_RANGE_TYPE_SRC = 0,
@@ -48,7 +49,7 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf);
+void ggml_graph_optimize(struct ggml_cgraph * gf, const struct ggml_metal_device_props * props);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);

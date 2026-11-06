@@ -10,6 +10,7 @@ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 constant bool FC_mul_mm_nr1_64 [[function_constant(FC_MUL_MM + 8)]];
+constant bool FC_mul_mm_head_store [[function_constant(FC_MUL_MM + 9)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -345,14 +346,18 @@ kernel void kernel_mul_mm(
         }
     }
 
+    // The merged-head output keeps each head contiguous while placing all heads before the time dimension.
+    const int row_stride = FC_mul_mm_head_store ? args.ne0*FC_mul_mm_ne12 : args.ne0;
+    const uint64_t batch_offset = FC_mul_mm_head_store ? (uint64_t) im*args.ne0 : im*args.ne1*args.ne0;
+
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (r1 + 16*(sgitg >> 1)) * row_stride + batch_offset;
 
         for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*row_stride*(i/4), row_stride, 0, false);
         }
     } else {
         // block is smaller than 64x32, we should avoid writing data outside of the matrix
@@ -368,7 +373,7 @@ kernel void kernel_mul_mm(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*row_stride + batch_offset;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = temp_str + (j*NR0);

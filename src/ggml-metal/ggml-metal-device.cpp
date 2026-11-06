@@ -950,7 +950,7 @@ static int ggml_metal_mul_mm_tensor_nr1(const ggml_tensor * op) {
     return ne0 >= 256 && ne1 > 64 && (ne1 + 63)/64*64 == (ne1 + 31)/32*32 && tiles >= 32 ? 64 : 32;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool merge_heads) {
     char base[256];
     char name[256];
 
@@ -960,6 +960,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+
+    GGML_ASSERT(!merge_heads || !has_tensor);
 
     const int nr1 = has_tensor ? ggml_metal_mul_mm_tensor_nr1(op) : 32;
 
@@ -975,8 +977,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool f32_operands = tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), f32_operands ? "_f32" : "");
-    snprintf(name, 256, "%s_bci=%d_bco=%d_nr1=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, nr1, ne12, ne13, r2, r3);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_nr1=%d_ne12=%d_ne13=%d_r2=%d_r3=%d%s",
+             base, bc_inp, bc_out, nr1, ne12, ne13, r2, r3, merge_heads ? "_head_store" : "");
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -989,6 +991,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
         ggml_metal_cv_set_bool(cv, nr1 == 64, FC_MUL_MM + 8);
+        ggml_metal_cv_set_bool(cv, merge_heads, FC_MUL_MM + 9);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
