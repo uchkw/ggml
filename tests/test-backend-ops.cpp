@@ -9825,6 +9825,10 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    for (const auto & c : head_store_cases()) {
+        if (c.cpu_reference) test_cases.emplace_back(new test_attention_head_store(c));
+    }
+
     // outputs of 64 modulo 128 columns, past which Metal's tensor-API kernel_mul_mm stored its last tile
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 64, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 192, 256, {1, 1}, {1, 1}));
@@ -12572,10 +12576,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // F32 by F32 whose src1 asks for GGML_PREC_F32: SEMamba's output projections and a square product
-    for (const auto & c : head_store_cases()) {
-        if (c.cpu_reference) test_cases.emplace_back(new test_attention_head_store(c));
-    }
-
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 64, 151*81, 128, -1.0f, 1.0f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 64, 251*161, 128, -1.0f, 1.0f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_mul_mat_f32_operands(GGML_TYPE_F32, 1024, 1024, 1024, -1.0f, 1.0f, -1.0f, 1.0f));
