@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "test-mm-glu-cases.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7927,6 +7928,62 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// MUL_MAT -> SIGMOID -> MUL with an independent factor a, the gate-projection epilogue planned
+// for Metal simdgroup MM: a * sigmoid(W_gate*x), never SiLU, never a packed pair of projections.
+// The gate product and the sigmoid are compared against the CPU reference as well as the final
+// output, so every stage of the planned fusion keeps its ordinary semantics. The case table and
+// graph fixture are shared with tests/test-metal-mm-glu.cpp through test-mm-glu-cases.h.
+struct test_mul_mat_glu : public test_case {
+    const mm_glu_case c;
+    mm_glu_graph glu = {};
+
+    test_mul_mat_glu(const mm_glu_case & c) : c(c) {}
+
+    std::string vars() override {
+        return "type=" + var_to_str(c.type) + ",width=" + std::to_string(c.width) +
+               ",k=" + std::to_string(c.k) + ",frames=" + std::to_string(c.frames) +
+               ",swap=" + std::to_string(c.swap) + ",variant=" + c.variant;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        const uint64_t projections = std::string(c.variant) == "twoproj" ? 2 : 1;
+        return projections * 2 * c.width * c.frames * c.k;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        glu = mm_glu_build(ctx, c);
+        return glu.out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { glu.mm, glu.sigmoid, glu.out };
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        mm_glu_initialize(glu, c);
+        // the fixture writes the deterministic inputs; everything else the framework added
+        // (sentinels, computed intermediates) keeps the default uniform initialization
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t != glu.w_base && t != glu.wa && t != glu.x_base && t != glu.a_base &&
+                t != glu.x && t != glu.a) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11053,6 +11110,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
+    // MUL_MAT + SIGMOID + MUL with an independent factor (the gate-projection epilogue planned
+    // for Metal). The cross-backend subset keeps the ordinary in-memory semantics: the output
+    // alias and mapped-wrapper controls only run in tests/test-metal-mm-glu.cpp, which controls
+    // their buffers explicitly.
+    for (const mm_glu_case & glu_case : mm_glu_cases()) {
+        if (mm_glu_case_is_cross_backend(glu_case)) {
+            test_cases.emplace_back(new test_mul_mat_glu(glu_case));
         }
     }
 
