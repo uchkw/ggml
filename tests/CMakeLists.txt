@@ -168,6 +168,10 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+if (GGML_METAL)
+    add_executable(test-metal-conformer-glu test-metal-conformer-glu.cpp)
+    target_link_libraries(test-metal-conformer-glu PRIVATE ggml)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     #

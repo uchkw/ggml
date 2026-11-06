@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "test-conformer-glu-cases.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4060,6 +4061,33 @@ struct test_relu_sqr : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// The whole graph preserves output and consumer guards while comparing Conformer's GLU with the CPU.
+struct test_conformer_glu : public test_case {
+    const conformer_glu_case c;
+    conformer_glu_graph graph{};
+
+    explicit test_conformer_glu(conformer_glu_case c) : c(c) {}
+    std::string op_desc(ggml_tensor *) override { return "CONFORMER_GLU"; }
+    std::string vars() override {
+        return "type=" + std::string(ggml_type_name(c.type)) + ",width=" + std::to_string(c.width) +
+               ",frames=" + std::to_string(c.frames) + ",swap=" + std::to_string(c.swap) + ",variant=" + c.variant;
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return c.type == GGML_TYPE_F16 ? 5e-5 : 1e-7; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        graph = conformer_glu_build(ctx, c);
+        return graph.out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        conformer_glu_initialize(graph, c);
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return std::string(c.variant) == "output" ? std::vector<ggml_tensor *>{graph.unary, graph.out} :
+                                                  std::vector<ggml_tensor *>{graph.out};
     }
 };
 
@@ -9859,6 +9887,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
     }
+
+    for (const auto & c : conformer_glu_cases()) test_cases.emplace_back(new test_conformer_glu(c));
 
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
     for (ggml_unary_op op : { GGML_UNARY_OP_GELU, GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
