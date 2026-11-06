@@ -1396,4 +1396,9 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    int64_t ne4;
+    int32_t sigmoid_second;
+} ggml_metal_kargs_conformer_glu;
+
 #endif // GGML_METAL_IMPL

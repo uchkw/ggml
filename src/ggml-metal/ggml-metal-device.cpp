@@ -303,6 +303,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conformer_glu(ggml_metal_library_t lib) {
+    const char * name = "kernel_conformer_glu_f32";
+    auto result = ggml_metal_library_get_pipeline(lib, name);
+    if (!result.pipeline) result = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    return result;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));
 

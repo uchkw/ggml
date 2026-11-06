@@ -203,6 +203,31 @@ kernel void kernel_silu_back_f32(
     dx[gid] = dy[gid] * s * (1.0f + x[gid] * (1.0f - s));
 }
 
+inline float4 conformer_glu_product(float4 sigmoid, float4 a, bool second) {
+    #pragma METAL fp math_mode(safe)
+    #pragma METAL fp contract(off)
+    // Keep the separate sigmoid's rounded F32 result before multiplying in the original operand order.
+    return second ? a * sigmoid : sigmoid * a;
+}
+
+kernel void kernel_conformer_glu_f32(
+        constant ggml_metal_kargs_conformer_glu & args,
+        device const float * gate,
+        device const float * factor,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int64_t) gid >= args.ne4) return;
+    const int64_t i = (int64_t) gid * 4;
+    const float4 x = float4(gate[i], gate[i + 1], gate[i + 2], gate[i + 3]);
+    const float4 a = float4(factor[i], factor[i + 1], factor[i + 2], factor[i + 3]);
+    const float4 sigmoid = 1 / (1 + exp(-x));
+    const float4 result = conformer_glu_product(sigmoid, a, args.sigmoid_second != 0);
+    dst[i] = result.x;
+    dst[i + 1] = result.y;
+    dst[i + 2] = result.z;
+    dst[i + 3] = result.w;
+}
+
 template<typename T>
 kernel void kernel_reglu(
         constant ggml_metal_kargs_glu & args,

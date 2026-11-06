@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -707,6 +709,50 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+static bool ggml_metal_glu_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_METAL_GLU");
+        if (value == nullptr || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        GGML_ABORT("GGML_METAL_GLU must be 0 or 1");
+    }();
+    return enabled;
+}
+
+static bool ggml_metal_fusion_check_conformer_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    const ggml_tensor * unary = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+    if (!ggml_metal_glu_enabled() || ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID ||
+        (mul->src[0] == unary) == (mul->src[1] == unary)) return false;
+    const ggml_tensor * gate = unary->src[0];
+    const ggml_tensor * a = mul->src[mul->src[0] == unary ? 1 : 0];
+    if (unary->ne[0] != 1024 || unary->ne[1] < 1 || ggml_nelements(unary) > INT32_MAX ||
+        unary->ne[2] != 1 || unary->ne[3] != 1) return false;
+    for (const auto * tensor : {unary, mul, gate, a}) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_are_same_shape(tensor, unary) || !ggml_is_contiguous(tensor)) return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // Each lane loads both original operands before its store; only an exact in-place range is safe.
+        for (const auto * input : {gate, a}) {
+            if (mul->data != input->data && ggml_metal_fusion_overlap(mul, input)) return false;
+        }
+        // A separate sigmoid that overwrites the factor changes the meaning of the following multiplication.
+        if (ggml_metal_fusion_overlap(unary, a)) return false;
+        if (unary->data != gate->data && ggml_metal_fusion_overlap(unary, gate)) return false;
+    }
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -757,6 +803,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_conformer_glu = { GGML_OP_UNARY, GGML_OP_MUL };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -786,6 +833,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_CONFORMER_GLU,  ops_conformer_glu,          {},     false, ggml_metal_fusion_check_conformer_glu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -836,6 +884,8 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // This pointwise kernel validates overlap after allocation without extending input lifetimes.
+            if (fusion.id == GGML_METAL_FUSION_CONFORMER_GLU) continue;
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
