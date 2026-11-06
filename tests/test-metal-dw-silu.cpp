@@ -190,9 +190,10 @@ struct MappedArena {
             throw std::runtime_error("cannot create two distinct Metal mappings of the depthwise arena");
         }
         const std::vector<ggml_tensor *> roots{t.input_storage, t.weight_storage, t.bias_storage, t.activation};
+        const bool conv_bias = variant.find("conv_bias") != std::string::npos;
         for (size_t i = 0; i < roots.size(); i++) {
             size_t offset = i*stride;
-            if (i == 3) {
+            if (i == 3 && !conv_bias) {
                 if (variant.find("input") != std::string::npos) offset = 0;
                 if (variant.find("kernel") != std::string::npos) offset = stride;
                 if (variant.find("bias") != std::string::npos) offset = 2*stride;
@@ -201,6 +202,13 @@ struct MappedArena {
             if (ggml_backend_tensor_alloc(i == 3 ? second.get() : first.get(), roots[i],
                     static_cast<char *>(data) + offset) != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("cannot bind the mapped depthwise tensor");
+            }
+        }
+        if (conv_bias) {
+            const size_t offset = 2*stride + (variant.find("partial") != std::string::npos ? sizeof(float) : 0);
+            const auto wrapper = variant.find("same") != std::string::npos ? first.get() : second.get();
+            if (ggml_backend_tensor_alloc(wrapper, t.conv, static_cast<char *>(data) + offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("cannot bind the convolution output over the bias");
             }
         }
     }
@@ -224,6 +232,14 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
     if (mapped && (t.activation->buffer == t.input->buffer || t.activation->buffer == t.kernel->buffer ||
                    t.activation->buffer == t.bias->buffer)) {
         throw std::runtime_error("the mapped output does not use a separate buffer wrapper");
+    }
+    const std::string variant(c.variant);
+    if (variant.find("conv_bias") != std::string::npos) {
+        const size_t offset = variant.find("partial") != std::string::npos ? sizeof(float) : 0;
+        if (t.conv->data != static_cast<char *>(t.bias->data) + offset ||
+            (t.conv->buffer == t.bias->buffer) != (variant.find("same") != std::string::npos)) {
+            throw std::runtime_error("the convolution output and bias do not have the requested mapped alias");
+        }
     }
     std::vector<ggml_tensor *> protected_tensors;
     for (auto * tensor : {t.conv, t.sum}) {
