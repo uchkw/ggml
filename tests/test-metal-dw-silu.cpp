@@ -1,6 +1,7 @@
 // Compares depthwise convolution, bias and SiLU with Metal fusion disabled and enabled, bit for bit.
 // Restored inputs and poisoned outputs expose stale stores, including output aliases of external inputs.
-// Usage: test-metal-dw-silu [expect-fusion: 0|1]. JSON Lines go to stdout.
+// Usage: test-metal-dw-silu [expect-fusion: 0|1] [output.bin]. JSON Lines go to stdout.
+// The optional binary stores each enabled output in logical element order for exact comparisons between builds.
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -214,7 +215,7 @@ struct MappedArena {
     }
 };
 
-static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_silu_case & c, bool expected) {
+static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_silu_case & c, bool expected, FILE * dump) {
     constexpr int graph_size = 64;
     ggml_init_params params{ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(graph_size, false), nullptr, true};
     Context context(ggml_init(params), ggml_free);
@@ -268,6 +269,9 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
     }
     compute(backend, graph, fusion, true);
     const auto candidate = read(t.out);
+    if (dump && std::fwrite(candidate.data(), sizeof(float), candidate.size(), dump) != candidate.size()) {
+        throw std::runtime_error("cannot write the enabled output dump");
+    }
     const uint64_t enabled_count = fusion.count();
     bool protected_equal = true, values_finite = finite(baseline) && finite(candidate);
     for (size_t i = 0; i < protected_tensors.size(); i++) {
@@ -306,9 +310,11 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
 int main(int argc, char ** argv) {
     try {
         const int expected = argc > 1 ? std::stoi(argv[1]) : 0;
-        if (argc > 2 || (expected != 0 && expected != 1)) {
-            throw std::runtime_error("usage: test-metal-dw-silu [expect-fusion: 0|1]");
+        if (argc > 3 || (expected != 0 && expected != 1)) {
+            throw std::runtime_error("usage: test-metal-dw-silu [expect-fusion: 0|1] [output.bin]");
         }
+        std::unique_ptr<FILE, decltype(&std::fclose)> dump(argc > 2 ? ggml_fopen(argv[2], "wb") : nullptr, std::fclose);
+        if (argc > 2 && !dump) throw std::runtime_error("cannot open the enabled output dump");
         ggml_backend_load_all();
         Backend backend(ggml_backend_init_by_name("MTL0", nullptr), ggml_backend_free);
         if (!backend) throw std::runtime_error("cannot initialize MTL0");
@@ -316,7 +322,8 @@ int main(int argc, char ** argv) {
         check_poison_guard(backend.get());
         const auto cases = dw_silu_cases();
         size_t failed = 0;
-        for (const auto & c : cases) failed += !run_case(backend.get(), fusion, c, expected != 0);
+        for (const auto & c : cases) failed += !run_case(backend.get(), fusion, c, expected != 0, dump.get());
+        if (dump && std::fflush(dump.get()) != 0) throw std::runtime_error("cannot flush the enabled output dump");
         fusion.enable(fusion.info, true);
         std::printf("{\"kind\":\"summary\",\"poison_guard_cases\":2,\"cases\":%zu,\"failed\":%zu}\n", cases.size(), failed);
         return failed ? 1 : 0;
