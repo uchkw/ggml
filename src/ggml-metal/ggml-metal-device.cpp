@@ -7,6 +7,8 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -950,6 +952,22 @@ static int ggml_metal_mul_mm_tensor_nr1(const ggml_tensor * op) {
     return ne0 >= 256 && ne1 > 64 && (ne1 + 63)/64*64 == (ne1 + 31)/32*32 && tiles >= 32 ? 64 : 32;
 }
 
+// The experiment keeps the same operands and K steps and changes only the columns computed by a simdgroup tile.
+static int ggml_metal_mul_mm_simdgroup_nr1(const ggml_tensor * op) {
+    const char * setting = std::getenv("GGML_METAL_MM_TILE_N");
+    GGML_ASSERT(setting == nullptr || std::strcmp(setting, "32") == 0 || std::strcmp(setting, "64") == 0);
+    if (setting == nullptr || std::strcmp(setting, "32") == 0) {
+        return 32;
+    }
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    const int64_t m = op->ne[0], k = a->ne[0];
+    const bool shape = (m == 4096 && k == 1024) || (m == 1024 && (k == 4096 || k == 1024));
+    return shape && op->ne[1] > 16 && (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_Q8_0) &&
+           b->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+           a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 ? 64 : 32;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -961,7 +979,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
-    const int nr1 = has_tensor ? ggml_metal_mul_mm_tensor_nr1(op) : 32;
+    const int nr1 = has_tensor ? ggml_metal_mul_mm_tensor_nr1(op) : ggml_metal_mul_mm_simdgroup_nr1(op);
 
     const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % nr1 != 0;
 
@@ -1006,8 +1024,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         // two buffers of the operands of a step
         res.smem = 2*(64 + nr1)*32*ts;
     } else {
-        // the operands of a step, or the 64x32 floats of an output tile that ends inside it
-        res.smem = std::max<size_t>((64 + 32)*32*ts, bc_out ? 64*32*sizeof(float) : 0);
+        // the operands of a step, or the floats of an output tile that ends inside it
+        res.smem = std::max<size_t>((64 + nr1)*32*ts, bc_out ? 64*nr1*sizeof(float) : 0);
     }
 
     return res;

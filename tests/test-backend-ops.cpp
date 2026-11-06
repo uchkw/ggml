@@ -5410,6 +5410,16 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// These products cover the encoder's dense projections and the last tiles of both 32 and 64 columns.
+struct test_mul_mat_simdgroup_tile : public test_mul_mat {
+    test_mul_mat_simdgroup_tile(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",simdgroup_tile=1";
+    }
+};
+
 // GGML_OP_MUL_MAT with large values: activations from b_min to b_max and weights from a_min to a_max, so that a block of
 // 32 activations sums past half precision (65504), or the products themselves do, either of which a backend that
 // carries them in half precision turns into inf, NaN or 65504
@@ -10994,6 +11004,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (const auto & mk : {std::array<int64_t, 2>{4096, 1024}, {1024, 4096}, {1024, 1024}}) {
+            for (int n : {17, 31, 32, 33, 38, 63, 64, 65, 75, 96, 97, 125, 127, 128, 129, 171, 172, 250, 341, 375, 749}) {
+                test_cases.emplace_back(new test_mul_mat_simdgroup_tile(type, mk[0], n, mk[1]));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
