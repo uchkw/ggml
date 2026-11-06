@@ -104,6 +104,11 @@ void ggml_metal_library_free(ggml_metal_library_t lib);
 
 ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
 
+/** Diagnostic snapshots leave encoding and command-buffer policy unchanged. */
+bool ggml_metal_library_pipeline_trace_enabled(ggml_metal_library_t lib);
+void ggml_metal_library_pipeline_trace(ggml_metal_library_t lib, const char * phase,
+                                      const void * context, uint64_t graph, int nodes, int n_cb);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 

@@ -82,6 +82,7 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+    uint64_t trace_graphs;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -481,6 +482,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_SUCCESS;
     }
 
+    const bool trace = ggml_metal_library_pipeline_trace_enabled(ctx->lib);
+    const uint64_t trace_graph = trace ? ++ctx->trace_graphs : 0;
+    if (trace) {
+        ggml_metal_library_pipeline_trace(ctx->lib, "encode_begin", ctx, trace_graph, gf->n_nodes, ctx->n_cb);
+    }
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
@@ -656,6 +663,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    if (trace) {
+        ggml_metal_library_pipeline_trace(ctx->lib, "encode_end", ctx, trace_graph, gf->n_nodes, ctx->n_cb);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

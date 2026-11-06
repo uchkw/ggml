@@ -11,6 +11,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <time.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -160,6 +161,54 @@ static const char * const k_lib_names[GGML_METAL_LIB_COUNT] = {
 #undef X
 };
 
+#define GGML_METAL_PIPELINE_TRACE_NAMES 128
+
+struct ggml_metal_pipeline_trace {
+    uint64_t library_id;
+    uint64_t lookups, hits, misses;
+    uint64_t compile_entries, recheck_hits, compile_misses, missing_kernels;
+    uint64_t new_function_calls, new_function_failures;
+    uint64_t new_compute_pipeline_state_calls, new_compute_pipeline_state_failures;
+    uint64_t new_compute_pipeline_state_successes, incompatible_pipeline_states, cache_inserts;
+    size_t names_count, names_emitted;
+    char names[GGML_METAL_PIPELINE_TRACE_NAMES][256];
+};
+
+static struct ggml_metal_pipeline_trace * ggml_metal_pipeline_trace_init(void) {
+    static atomic_uint_fast64_t next_id = 1;
+    struct ggml_metal_pipeline_trace * trace = calloc(1, sizeof(*trace));
+    GGML_ASSERT(trace);
+    trace->library_id = atomic_fetch_add_explicit(&next_id, 1, memory_order_relaxed);
+    return trace;
+}
+
+static bool ggml_metal_pipeline_trace_requested(void) {
+    const char * value = getenv("GGML_METAL_PIPELINE_TRACE");
+    if (value == NULL || strcmp(value, "0") == 0) {
+        return false;
+    }
+    GGML_ASSERT(strcmp(value, "1") == 0 && "GGML_METAL_PIPELINE_TRACE must be 0 or 1");
+    return true;
+}
+
+// These timestamps are durations within this process, not a clock shared with the caller.
+static uint64_t ggml_metal_pipeline_trace_us(void) {
+    struct timespec value;
+    GGML_ASSERT(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    return (uint64_t) value.tv_sec * 1000000 + (uint64_t) value.tv_nsec / 1000;
+}
+
+static void ggml_metal_pipeline_trace_write(NSDictionary * record) {
+    NSData * data = [NSJSONSerialization dataWithJSONObject:record options:0 error:NULL];
+    GGML_ASSERT(data);
+    flockfile(stderr);
+    fputs("GGML_METAL_PIPELINE_TRACE ", stderr);
+    fwrite(data.bytes, 1, data.length, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+    funlockfile(stderr);
+}
+
 struct ggml_metal_library {
     // Per-kind compiled libraries. When single_library is true, the whole library
     // (e.g. a pre-compiled default.metallib or a from-source build) lives at
@@ -181,7 +230,48 @@ struct ggml_metal_library {
     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
 
     NSLock * lock;
+    struct ggml_metal_pipeline_trace * trace;
 };
+
+bool ggml_metal_library_pipeline_trace_enabled(ggml_metal_library_t lib) {
+    return lib->trace != NULL;
+}
+
+void ggml_metal_library_pipeline_trace(ggml_metal_library_t lib, const char * phase,
+                                      const void * context, uint64_t graph, int nodes, int n_cb) {
+    if (!lib->trace) {
+        return;
+    }
+    [lib->lock lock];
+    const struct ggml_metal_pipeline_trace snapshot = *lib->trace;
+    lib->trace->names_emitted = lib->trace->names_count;
+    [lib->lock unlock];
+
+    @autoreleasepool {
+        NSMutableArray * names = [NSMutableArray array];
+        for (size_t i = snapshot.names_emitted; i < snapshot.names_count; ++i) {
+            [names addObject:[NSString stringWithUTF8String:snapshot.names[i]]];
+        }
+        ggml_metal_pipeline_trace_write(@{
+            @"event": @"pipeline_snapshot", @"phase": [NSString stringWithUTF8String:phase],
+            @"library": @(snapshot.library_id),
+            @"context": [NSString stringWithFormat:@"%p", (void *) context],
+            @"graph": @(graph), @"nodes": @(nodes), @"n_cb": @(n_cb),
+            @"lookups": @(snapshot.lookups), @"hits": @(snapshot.hits), @"misses": @(snapshot.misses),
+            @"compile_entries": @(snapshot.compile_entries), @"recheck_hits": @(snapshot.recheck_hits),
+            @"compile_misses": @(snapshot.compile_misses), @"missing_kernels": @(snapshot.missing_kernels),
+            @"new_function_calls": @(snapshot.new_function_calls), @"new_function_failures": @(snapshot.new_function_failures),
+            @"new_compute_pipeline_state_calls": @(snapshot.new_compute_pipeline_state_calls),
+            @"new_compute_pipeline_state_failures": @(snapshot.new_compute_pipeline_state_failures),
+            @"new_compute_pipeline_state_successes": @(snapshot.new_compute_pipeline_state_successes),
+            @"incompatible_pipeline_states": @(snapshot.incompatible_pipeline_states),
+            @"cache_inserts": @(snapshot.cache_inserts),
+            @"miss_names": names, @"miss_names_recorded": @(snapshot.names_count),
+            @"miss_names_omitted": @(snapshot.compile_misses - snapshot.names_count),
+            @"miss_names_limit": @(GGML_METAL_PIPELINE_TRACE_NAMES),
+        });
+    }
+}
 
 // Build the fn_to_lib routing table by querying each compiled library's public
 // function names. Call once after all per-kind libraries have been compiled.
@@ -321,6 +411,10 @@ static bool ggml_metal_library_compile_all(
         NSString * (^source_for_kind)(int kind, NSError ** err),
         const char * origin) {
     const int64_t t_start = ggml_time_us();
+    const uint64_t trace_start = res->trace ? ggml_metal_pipeline_trace_us() : 0;
+    uint64_t * trace_api_us = res->trace ? calloc(GGML_METAL_LIB_COUNT, sizeof(uint64_t)) : NULL;
+    bool * trace_called = res->trace ? calloc(GGML_METAL_LIB_COUNT, sizeof(bool)) : NULL;
+    GGML_ASSERT(!res->trace || (trace_api_us && trace_called));
 
     int64_t  * t_per_lib   = calloc(GGML_METAL_LIB_COUNT, sizeof(int64_t));
     NSError ** err_per_lib = calloc(GGML_METAL_LIB_COUNT, sizeof(NSError *));
@@ -350,7 +444,14 @@ static bool ggml_metal_library_compile_all(
                 options.preprocessorMacros = prep;
                 ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(res->dev)->has_tensor);
 
+                const uint64_t trace_api_start = res->trace ? ggml_metal_pipeline_trace_us() : 0;
+                if (res->trace) {
+                    trace_called[kind] = true;
+                }
                 lib = [device newLibraryWithSource:src options:options error:&error];
+                if (res->trace) {
+                    trace_api_us[kind] = ggml_metal_pipeline_trace_us() - trace_api_start;
+                }
 
                 [options release];
 
@@ -374,6 +475,30 @@ static bool ggml_metal_library_compile_all(
     }
     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
     dispatch_release(group);
+
+    if (res->trace) {
+        const uint64_t parallel_wall_us = ggml_metal_pipeline_trace_us() - trace_start;
+        @autoreleasepool {
+            NSMutableArray * kinds = [NSMutableArray array];
+            uint64_t calls = 0, successes = 0, sum_api_us = 0;
+            for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+                calls += trace_called[kind];
+                successes += res->objs[kind] != nil;
+                sum_api_us += trace_api_us[kind];
+                [kinds addObject:@{@"name": [NSString stringWithUTF8String:k_lib_names[kind]],
+                                  @"called": @(trace_called[kind]), @"success": @(res->objs[kind] != nil),
+                                  @"api_us": @(trace_api_us[kind])}];
+            }
+            ggml_metal_pipeline_trace_write(@{
+                @"event": @"source_libraries", @"library": @(res->trace->library_id),
+                @"origin": [NSString stringWithUTF8String:origin], @"new_library_with_source_calls": @(calls),
+                @"successes": @(successes), @"parallel_wall_us": @(parallel_wall_us),
+                @"sum_library_api_us": @(sum_api_us), @"kinds": kinds,
+            });
+        }
+    }
+    free(trace_called);
+    free(trace_api_us);
 
     const bool ok = !atomic_load(&any_failure);
 
@@ -452,6 +577,9 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     res->dev       = dev;
     res->pipelines = ggml_metal_pipelines_init();
     res->lock      = [NSLock new];
+    if (ggml_metal_pipeline_trace_requested()) {
+        res->trace = ggml_metal_pipeline_trace_init();
+    }
 
     // shared MTLCompileOptions preprocessor macros (matches the build-time defines)
     NSMutableDictionary * prep = [NSMutableDictionary dictionary];
@@ -612,6 +740,8 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     NSError * error = nil;
 
     const int64_t t_start = ggml_time_us();
+    const bool trace = ggml_metal_pipeline_trace_requested();
+    uint64_t trace_api_us = 0;
 
     NSString * src = [[NSString alloc] initWithBytes:source
                                               length:strlen(source)
@@ -628,7 +758,11 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
         options.preprocessorMacros = prep;
         ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(dev)->has_tensor);
 
+        const uint64_t trace_start = trace ? ggml_metal_pipeline_trace_us() : 0;
         library = [device newLibraryWithSource:src options:options error:&error];
+        if (trace) {
+            trace_api_us = ggml_metal_pipeline_trace_us() - trace_start;
+        }
         if (error) {
             if (verbose) {
                 GGML_LOG_ERROR("%s: error compiling source: %s\n", __func__, [[error description] UTF8String]);
@@ -642,6 +776,15 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     }
 
     [src release];
+
+    if (trace) {
+        @autoreleasepool {
+            ggml_metal_pipeline_trace_write(@{
+                @"event": @"source_library_from_source", @"new_library_with_source_calls": @1,
+                @"successes": @(library != nil), @"library_api_us": @(trace_api_us),
+            });
+        }
+    }
 
     if (!library) {
         if (verbose) {
@@ -666,6 +809,9 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     res->dev            = dev;
     res->pipelines      = ggml_metal_pipelines_init();
     res->lock           = [NSLock new];
+    if (trace) {
+        res->trace = ggml_metal_pipeline_trace_init();
+    }
 
     return res;
 }
@@ -674,6 +820,9 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
     if (!lib) {
         return;
     }
+
+    ggml_metal_library_pipeline_trace(lib, "library_free", NULL, 0, 0, 0);
+    free(lib->trace);
 
     for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
         if (lib->objs[kind]) {
@@ -714,6 +863,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
+    if (lib->trace) {
+        ++lib->trace->lookups;
+        if (res.pipeline) ++lib->trace->hits;
+        else ++lib->trace->misses;
+    }
 
     [lib->lock unlock];
 
@@ -733,11 +887,20 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
     [lib->lock lock];
 
+    if (lib->trace) ++lib->trace->compile_entries;
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
     if (res.pipeline) {
+        if (lib->trace) ++lib->trace->recheck_hits;
         [lib->lock unlock];
 
         return res;
+    }
+
+    if (lib->trace) {
+        ++lib->trace->compile_misses;
+        if (lib->trace->names_count < GGML_METAL_PIPELINE_TRACE_NAMES) {
+            snprintf(lib->trace->names[lib->trace->names_count++], 256, "%s", name);
+        }
     }
 
     @autoreleasepool {
@@ -755,6 +918,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         } else if (!lib->single_library) {
             NSNumber * idx = lib->fn_to_lib[base_func];
             if (!idx) {
+                if (lib->trace) ++lib->trace->missing_kernels;
                 [lib->lock unlock];
 
                 GGML_LOG_ERROR("%s: kernel not found in any metal library: base = '%s', name = '%s'\n", __func__, base, name);
@@ -767,12 +931,14 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         id<MTLLibrary> mtl_lib = lib->objs[lib_idx];
 
         id<MTLFunction> mtl_function;
+        if (lib->trace) ++lib->trace->new_function_calls;
         if (!cv) {
             mtl_function = [mtl_lib newFunctionWithName:base_func];
         } else {
             mtl_function = [mtl_lib newFunctionWithName:base_func constantValues:cv->obj error:&error];
         }
         if (!mtl_function) {
+            if (lib->trace) ++lib->trace->new_function_failures;
             [lib->lock unlock];
 
             GGML_LOG_ERROR("%s: failed to compile pipeline: base = '%s', name = '%s'\n", __func__, base, name);
@@ -784,7 +950,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
+        if (lib->trace) ++lib->trace->new_compute_pipeline_state_calls;
         id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        if (lib->trace) {
+            if (obj) ++lib->trace->new_compute_pipeline_state_successes;
+            else ++lib->trace->new_compute_pipeline_state_failures;
+        }
 
         [mtl_function release];
 
@@ -805,6 +976,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
                 (int)    obj.threadExecutionWidth);
 
         if (obj.maxTotalThreadsPerThreadgroup == 0 || obj.threadExecutionWidth == 0) {
+            if (lib->trace) ++lib->trace->incompatible_pipeline_states;
             [obj release];
 
             [lib->lock unlock];
@@ -818,6 +990,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         res.pipeline->obj = obj;
 
         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
+        if (lib->trace) ++lib->trace->cache_inserts;
     }
 
     [lib->lock unlock];
