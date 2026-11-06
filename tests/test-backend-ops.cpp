@@ -6348,6 +6348,7 @@ struct test_add_soft_max_relpos : public test_case {
     ggml_tensor * bd = nullptr;
     ggml_tensor * scores = nullptr;
     ggml_tensor * probabilities = nullptr;
+    ggml_tensor * alias_storage = nullptr;
 
     test_add_soft_max_relpos(int64_t t, int64_t heads, bool extreme = false, std::string variant = "relative")
         : t(t), heads(heads), extreme(extreme), variant(std::move(variant)) {}
@@ -6357,7 +6358,7 @@ struct test_add_soft_max_relpos : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 1e-6; }
 
-    bool expects_fusion() const { return variant == "relative" || variant == "consumer"; }
+    bool expects_fusion() const { return variant == "relative" || variant == "consumer" || variant == "alias_ac"; }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         return variant == "output" ? std::vector<ggml_tensor *>{scores, probabilities}
@@ -6371,6 +6372,9 @@ struct test_add_soft_max_relpos : public test_case {
         bd = ggml_new_tensor_3d(ctx, type, 2*t - 1, rows, heads);
         ggml_set_name(ac, "ac");
         ggml_set_name(bd, "bd");
+        if (variant == "alias_ac" || variant == "partial_ac") {
+            alias_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(ac) + 4);
+        }
         ggml_tensor * a = ac;
         if (variant == "padded_ac") {
             a = ggml_view_3d(ctx, ac, t, rows, heads, ac->nb[1], ac->nb[2], sizeof(float));
@@ -6440,10 +6444,12 @@ static std::vector<std::unique_ptr<test_add_soft_max_relpos>> make_add_soft_max_
     for (int64_t t : {1, 31, 32, 33, 171, 172, 375}) {
         for (bool extreme : {false, true}) {
             cases.emplace_back(new test_add_soft_max_relpos(t, 8, extreme));
+            cases.emplace_back(new test_add_soft_max_relpos(t, 8, extreme, "alias_ac"));
         }
     }
     for (const char * variant : {"contiguous", "broadcast", "wrong_stride", "padded_ac", "view_ac", "swapped",
-                                "rectangular", "f16", "mask", "sinks", "inplace", "output", "reuse", "consumer"}) {
+                                "rectangular", "f16", "mask", "sinks", "inplace", "output", "reuse", "consumer",
+                                "partial_ac", "alias_bd"}) {
         cases.emplace_back(new test_add_soft_max_relpos(32, 3, false, variant));
     }
     return cases;
@@ -13183,16 +13189,28 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
             ok = false;
             break;
         }
+        const bool aliases_input = tc->alias_storage || tc->variant == "alias_bd";
+        if (tc->alias_storage) {
+            tc->ac->data = tc->alias_storage->data;
+            tc->ac->buffer = tc->alias_storage->buffer;
+            out->data = (char *) tc->ac->data + (tc->variant == "partial_ac" ? sizeof(float) : 0);
+            out->buffer = tc->ac->buffer;
+        } else if (tc->variant == "alias_bd") {
+            out->data = (char *) tc->bd->data + (tc->t - 1)*sizeof(float);
+            out->buffer = tc->bd->buffer;
+        }
         std::vector<ggml_tensor *> checked = tc->fusion_test_nodes();
         checked.push_back(out);
         for (tc->generation = 0; tc->generation < 2; ++tc->generation) {
             tc->initialize_tensors(ctx.get());
             const std::string name = tc->vars();
             write_dump(name.data(), name.size());
+            std::vector<std::vector<uint8_t>> inputs;
             for (ggml_tensor * input : {tc->ac, tc->bd}) {
                 std::vector<uint8_t> bytes(ggml_nbytes(input));
                 ggml_backend_tensor_get(input, bytes.data(), 0, bytes.size());
                 write_dump(bytes.data(), bytes.size());
+                inputs.emplace_back(std::move(bytes));
             }
             std::vector<uint8_t> reference;
             for (bool enabled : {false, true}) {
@@ -13209,6 +13227,14 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
                         ggml_fp32_to_fp16_row(poison.data(), half.data(), (int64_t) poison.size());
                         ggml_backend_tensor_set(tensor, half.data(), 0, half.size()*sizeof(ggml_fp16_t));
                     }
+                }
+                // Aliased output bytes are also inputs, so restore them after poisoning and before every execution.
+                ggml_backend_tensor_set(tc->ac, inputs[0].data(), 0, inputs[0].size());
+                ggml_backend_tensor_set(tc->bd, inputs[1].data(), 0, inputs[1].size());
+                std::vector<uint8_t> before;
+                if (aliases_input) {
+                    before.resize(ggml_nbytes(out));
+                    ggml_backend_tensor_get(out, before.data(), 0, before.size());
                 }
                 reset(finfo);
                 bool same = ggml_backend_graph_compute(exact_backend.get(), graph) == GGML_STATUS_SUCCESS;
@@ -13231,6 +13257,8 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
                     actual.resize(offset + ggml_nbytes(tensor));
                     ggml_backend_tensor_get(tensor, actual.data() + offset, 0, ggml_nbytes(tensor));
                 }
+                // A missing store must not pass by leaving the restored finite input in the output.
+                same = same && (!aliases_input || actual != before);
                 if (enabled) {
                     same = same && actual == reference;
                 } else {
