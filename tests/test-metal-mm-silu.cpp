@@ -237,13 +237,14 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const mm_sil
     const bool ok = finite && different == 0 && product_equal && disabled_count == 0 && enabled_count == want && allocation_dependencies == 0;
     std::printf("{\"kind\":\"comparison\",\"type\":\"%s\",\"m\":%lld,\"n\":%lld,\"k\":%lld,\"variant\":\"%s\","
                 "\"same_input_buffers\":true,\"outputs_poisoned_before_each_run\":true,\"poison_preserves_input_alias\":%s,"
-                "\"graph_optimized\":true,\"allocation_dependencies\":%zu,"
+                "\"graph_optimized\":true,\"product_marked_output\":%s,\"allocation_dependencies\":%zu,"
                 "\"input_a_fnv1a64\":\"%016llx\",\"input_b_fnv1a64\":\"%016llx\","
                 "\"output_disabled_fnv1a64\":\"%016llx\",\"output_enabled_fnv1a64\":\"%016llx\","
                 "\"disabled_fusions\":%llu,\"enabled_fusions\":%llu,\"expected_fusions\":%llu,"
                 "\"different_values\":%zu,\"max_abs\":%.17g,\"finite\":%s,\"protected_product_equal\":%s,\"passed\":%s}\n",
                 ggml_type_name(c.type), (long long) c.m, (long long) c.n, (long long) c.k, c.variant,
-                variant == "alias" ? "true" : "false", allocation_dependencies,
+                variant == "alias" ? "true" : "false", (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ? "true" : "false",
+                allocation_dependencies,
                 (unsigned long long) hash_bytes(packed.data(), packed.size()), (unsigned long long) hash_bytes(bv.data(), input_b_bytes),
                 (unsigned long long) hash_bytes(baseline.data(), baseline.size()*sizeof(float)),
                 (unsigned long long) hash_bytes(candidate.data(), candidate.size()*sizeof(float)),

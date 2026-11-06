@@ -17,9 +17,11 @@ static std::vector<mm_silu_case> mm_silu_cases() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         const std::vector<int64_t> columns = {17, 31, 32, 33, 38, 63, 64, 65, 75, 125, 171, 172, 250, 375};
         for (int64_t n : columns) cases.push_back({type, 4096, n, 1024, "plain", true});
-        for (const char * variant : {"offset", "inplace", "consumer"}) {
+        for (const char * variant : {"offset", "consumer"}) {
             cases.push_back({type, 4096, 33, 1024, variant, true});
         }
+        // Marking an in-place result as an output also protects its product through view_src.
+        cases.push_back({type, 4096, 33, 1024, "inplace", false});
         for (const char * variant : {"reuse", "output", "stride", "transpose", "batch", "relu", "alias"}) {
             cases.push_back({type, 4096, 33, 1024, variant, false});
         }
