@@ -3723,7 +3723,9 @@ struct test_residual_norm : public test_case {
 
     bool expects_fusion() const {
         return variant == "plain" || variant == "alias_a" || variant == "alias_b" ||
-               variant == "alias_residual" || variant == "same_inputs";
+               variant == "alias_residual" || variant == "same_inputs" ||
+               variant == "residual_alias_a" || variant == "residual_alias_b" ||
+               variant == "alias_chain_a" || variant == "alias_chain_b";
     }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
@@ -3811,7 +3813,8 @@ static std::vector<std::unique_ptr<test_residual_norm>> make_residual_norm_cases
         for (int distribution : {0, 1, 2, 3}) cases.emplace_back(new test_residual_norm(t, distribution));
     }
     for (int64_t t : {1, 33, 375}) {
-        for (const char * variant : {"alias_a", "alias_b", "alias_residual", "same_inputs"}) {
+        for (const char * variant : {"alias_a", "alias_b", "alias_residual", "same_inputs",
+                                    "residual_alias_a", "residual_alias_b", "alias_chain_a", "alias_chain_b"}) {
             cases.emplace_back(new test_residual_norm(t, 1, variant));
         }
     }
@@ -13222,14 +13225,20 @@ static bool run_residual_norm_exact(ggml_backend_t backend, const char * op_name
             }
         }
         const bool aliases_input = tc->variant == "alias_a" || tc->variant == "alias_b" ||
-                                   tc->variant == "partial_a" || tc->variant == "wrapper_a";
+                                   tc->variant == "partial_a" || tc->variant == "wrapper_a" ||
+                                   tc->variant == "alias_chain_a" || tc->variant == "alias_chain_b";
+        if (tc->variant == "residual_alias_a" || tc->variant == "alias_chain_a") {
+            tc->residual->data = tc->a->data;
+        } else if (tc->variant == "residual_alias_b" || tc->variant == "alias_chain_b") {
+            tc->residual->data = tc->b->data;
+        }
         if (tc->alias_storage) {
             ggml_tensor * input = tc->variant == "partial_a" ? tc->a : tc->residual;
             input->data = tc->alias_storage->data;
             out->data = (char *) input->data + 4*sizeof(float);
-        } else if (tc->variant == "alias_a") {
+        } else if (tc->variant == "alias_a" || tc->variant == "alias_chain_a") {
             out->data = tc->a->data;
-        } else if (tc->variant == "alias_b") {
+        } else if (tc->variant == "alias_b" || tc->variant == "alias_chain_b") {
             out->data = tc->b->data;
         } else if (tc->variant == "alias_residual") {
             out->data = tc->residual->data;
