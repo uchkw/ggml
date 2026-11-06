@@ -53,10 +53,11 @@ static std::vector<mm_glu_case> mm_glu_cases() {
         }
         // Broadcasting is valid only in src1, so the broadcast factor always follows the sigmoid.
         cases.push_back({type, 1024, 1024, 33, false, "broadcast", false});
-        // The encoder traversal order (factor projection first, then the candidate triple) fixes
-        // the mul operand order; a swapped two-projection graph interleves the factor projection
-        // between the sigmoid and the mul and is covered by the ordinary swapped cases.
-        cases.push_back({type, 1024, 1024, 33, false, "twoproj", true});
+        // The encoder traversal order needs the factor projection as src0 of the mul:
+        // mul(a, sigmoid(gate)) visits Wa*x first, then the consecutive gateMM, sigmoid and
+        // mul nodes. A sigmoid-first two-projection graph would visit gateMM and sigmoid
+        // before the factor projection and break the candidate triple apart.
+        cases.push_back({type, 1024, 1024, 33, true, "twoproj", true});
         if (type == GGML_TYPE_F32) {
             // Safe, valid unfused F32 views: only an F32 weight can back an F32 output alias.
             for (bool swap : {false, true}) {

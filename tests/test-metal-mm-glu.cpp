@@ -226,6 +226,23 @@ static bool run_case(ggml_backend_t backend, Fusion & fusion, const mm_glu_case 
     ggml_set_output(t.out);
     auto * graph = ggml_new_graph_custom(ctx.get(), nodes, false);
     ggml_build_forward_expand(graph, t.out);
+    if (t.a_mm) {
+        // Intended-path assertion on the constructed graph only (no timing or numerical
+        // evidence): the encoder order is the factor projection first, then the consecutive
+        // gate product, sigmoid and mul. Empty view nodes are skipped.
+        const ggml_tensor * sequence[4] = {t.a_mm, t.mm, t.sigmoid, t.mul};
+        int order = 0;
+        for (int i = 0; i < graph->n_nodes && order < 4; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_CONT) {
+                continue;
+            }
+            require(node == sequence[order], "the two-projection graph is not in encoder node order");
+            ++order;
+        }
+        require(order == 4, "the two-projection graph is missing a candidate node");
+    }
     const size_t dependencies = optimize(backend, graph);
 
     const bool mapped = variant.rfind("mapped_", 0) == 0;

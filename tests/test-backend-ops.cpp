@@ -7930,9 +7930,11 @@ struct test_mul_mat_vec_fusion : public test_case {
 
 // MUL_MAT -> SIGMOID -> MUL with an independent factor a, the gate-projection epilogue planned
 // for Metal simdgroup MM: a * sigmoid(W_gate*x), never SiLU, never a packed pair of projections.
-// The gate product and the sigmoid are compared against the CPU reference as well as the final
-// output, so every stage of the planned fusion keeps its ordinary semantics. The case table and
-// graph fixture are shared with tests/test-metal-mm-glu.cpp through test-mm-glu-cases.h.
+// The final output is always compared against the CPU reference; the gate product and the
+// sigmoid are compared only where the variant explicitly protects them as public outputs,
+// because a legal fusion elides ordinary intermediates and must not be compared as stale
+// storage. The case table and graph fixture are shared with tests/test-metal-mm-glu.cpp
+// through test-mm-glu-cases.h.
 struct test_mul_mat_glu : public test_case {
     const mm_glu_case c;
     mm_glu_graph glu = {};
@@ -7968,7 +7970,19 @@ struct test_mul_mat_glu : public test_case {
     }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        return { glu.mm, glu.sigmoid, glu.out };
+        // Ordinary cases compare only the final output: a legal fusion elides the gate product
+        // and the sigmoid, so their unprotected storage must not be compared as stale memory.
+        // Variants that explicitly protect the gate product or sigmoid as a public output
+        // compare exactly those protected intermediates in addition to the final output.
+        std::vector<ggml_tensor *> nodes;
+        if (glu.mm != nullptr && (glu.mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            nodes.push_back(glu.mm);
+        }
+        if (glu.sigmoid != nullptr && (glu.sigmoid->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            nodes.push_back(glu.sigmoid);
+        }
+        nodes.push_back(glu.out);
+        return nodes;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
