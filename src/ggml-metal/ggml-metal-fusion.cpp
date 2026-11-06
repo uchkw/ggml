@@ -145,8 +145,12 @@ static bool ggml_metal_fusion_check_add_soft_max(
     if (max_bias != 0.0f) {
         return false;
     }
-    return mode == GGML_METAL_FUSION_STRUCTURAL ||
-        (!ggml_metal_fusion_overlap(soft, ac) && !ggml_metal_fusion_overlap(soft, bd));
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+    // Softmax finishes its row maximum before each lane overwrites only the elements that lane reads.
+    const bool same_ac = soft->data == ac->data && ggml_are_same_layout(soft, ac);
+    return (same_ac || !ggml_metal_fusion_overlap(soft, ac)) && !ggml_metal_fusion_overlap(soft, bd);
 }
 
 // NORM/RMS_NORM + MUL + ADD: the weight/bias of each fused step must match the norm input
