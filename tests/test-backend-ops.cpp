@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "test-dw-silu-cases.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7026,6 +7027,41 @@ struct test_conv_2d_dw : public test_case {
     }
 };
 
+struct test_conv_dw_bias_silu : public test_case {
+    const dw_silu_case c;
+    dw_silu_graph tensors{};
+
+    explicit test_conv_dw_bias_silu(const dw_silu_case & c) : c(c) {}
+
+    std::string op_desc(ggml_tensor *) override { return "CONV_DW_BIAS_SILU"; }
+
+    std::string vars() override {
+        return "channels=" + std::to_string(c.channels) + ",frames=" + std::to_string(c.frames) +
+               ",weight_type=" + ggml_type_name(c.weight_type) + ",variant=" + c.variant;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        tensors = make_dw_silu_graph(ctx, c);
+        ggml_build_forward_expand(gf, tensors.bias);
+        return tensors.out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        initialize_dw_silu_graph(tensors, c);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> outputs{tensors.out};
+        for (auto * tensor : {tensors.conv, tensors.sum}) {
+            if (tensor->flags & GGML_TENSOR_FLAG_OUTPUT) outputs.push_back(tensor);
+        }
+        return outputs;
+    }
+};
+
 // GGML_OP_CONV_3D
 struct test_conv_3d : public test_case {
     // Logical 5D dimensions
@@ -10334,6 +10370,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_conv_2d_dw({1, 1, 64, 1}, {3, 3, 1, 64}, type, 1, 1, 1, cwhn));
             test_cases.emplace_back(new test_conv_2d_dw({1, 1, 1024, 1}, {9, 9, 1, 1024}, type, 1, 4, 1, cwhn));
         }
+    }
+
+    for (const auto & c : dw_silu_cases()) {
+        if (c.cpu_reference) test_cases.emplace_back(new test_conv_dw_bias_silu(c));
     }
 
     // CONV_3D
