@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -105,6 +107,47 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
 }
 
 // ---- pattern checks ------------------------------------------------------
+
+static bool ggml_metal_add_soft_max_enabled(const ggml_metal_device_props * props) {
+    const char * value = getenv("GGML_METAL_ADD_SOFTMAX");
+    if (value && strcmp(value, "0") != 0 && strcmp(value, "1") != 0) {
+        GGML_ABORT("GGML_METAL_ADD_SOFTMAX must be 0 or 1");
+    }
+    return value && strcmp(value, "1") == 0 && !props->has_tensor && props->device_id == GGML_METAL_DEVICE_M2_ULTRA;
+}
+
+// The second addend is the unpadded relative-position shift; its row stride is zero at T=1.
+static bool ggml_metal_fusion_check_add_soft_max(
+        const ggml_metal_fusion *,
+        const ggml_tensor * const * nodes,
+        const ggml_cgraph *,
+        const int *, int,
+        ggml_metal_fusion_mode mode) {
+    const ggml_tensor * add = nodes[0];
+    const ggml_tensor * soft = nodes[1];
+    const ggml_tensor * ac = add->src[0];
+    const ggml_tensor * bd = add->src[1];
+    if (!ac || !bd || ac->type != GGML_TYPE_F32 || bd->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || soft->type != GGML_TYPE_F32 || soft->src[0] != add ||
+            soft->src[1] || soft->src[2] || soft->view_src || add->view_src || ac->view_src ||
+            !ggml_is_contiguous(ac) || !ggml_is_contiguous(add) || !ggml_is_contiguous(soft) ||
+            !ggml_are_same_shape(ac, bd) || ac->ne[0] != ac->ne[1] || ac->ne[3] != 1 ||
+            ac->ne[0] > INT32_MAX/2 || ac->ne[2] > INT32_MAX || !bd->view_src) {
+        return false;
+    }
+    const uint64_t t = ac->ne[0];
+    if (bd->nb[0] != sizeof(float) || bd->nb[1] != (2*t - 2)*sizeof(float) ||
+            bd->nb[2] != t*(2*t - 1)*sizeof(float) || bd->view_offs != (t - 1)*sizeof(float)) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const char *) soft->op_params + sizeof(float), sizeof(float));
+    if (max_bias != 0.0f) {
+        return false;
+    }
+    return mode == GGML_METAL_FUSION_STRUCTURAL ||
+        (!ggml_metal_fusion_overlap(soft, ac) && !ggml_metal_fusion_overlap(soft, bd));
+}
 
 // NORM/RMS_NORM + MUL + ADD: the weight/bias of each fused step must match the norm input
 // width, be contiguous rows, and the fused outputs must stay F32
@@ -757,6 +800,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_add_soft_max = { GGML_OP_ADD, GGML_OP_SOFT_MAX };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -786,6 +830,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_ADD_SOFT_MAX,   ops_add_soft_max,           {},     false, ggml_metal_fusion_check_add_soft_max },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -836,6 +881,10 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // This pattern keeps the original allocation plan and rejects input overlap in FULL mode.
+            if (fusion.id == GGML_METAL_FUSION_ADD_SOFT_MAX) {
+                continue;
+            }
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
@@ -1074,6 +1123,7 @@ static bool ggml_metal_fusion_check_memory_ranges(
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
 const ggml_metal_fusion * ggml_metal_fusion_next(
+        const ggml_metal_device_props * props,
         const ggml_cgraph * gf,
         const int * node_idxs,
         int n_idxs,
@@ -1084,6 +1134,9 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     int best = 1;
 
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        if (fusion.id == GGML_METAL_FUSION_ADD_SOFT_MAX && !ggml_metal_add_soft_max_enabled(props)) {
+            continue;
+        }
         const int n_ops = (int) fusion.ops.size();
 
         // only look for a longer match than the current best
@@ -1168,7 +1221,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
 // span from idx to the last matched node (intermediate views are packed along).
-int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+int ggml_metal_fusion_max(const ggml_metal_device_props * props, const ggml_cgraph * gf, int idx) {
     // a view node cannot start a pattern - pack it alone
     if (ggml_op_is_empty(gf->nodes[idx]->op)) {
         return 1;
@@ -1192,7 +1245,7 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
     while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
         int len = 1;
-        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
+        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(props, gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
             break;
         }

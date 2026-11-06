@@ -453,7 +453,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri(ggml_metal_l
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_metal_library_t lib, const ggml_tensor * op, bool fuse_add) {
     GGML_ASSERT(!op->src[1] || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32);
 
     char base[256];
@@ -467,7 +467,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
 
     const ggml_type tsrc1 = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
 
-    snprintf(base, 256, "kernel_soft_max_%s%s", ggml_type_name(tsrc1), suffix);
+    snprintf(base, 256, "kernel_soft_max_%s%s%s", fuse_add ? "add_" : "", ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

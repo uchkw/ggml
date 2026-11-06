@@ -1,6 +1,28 @@
 #include "common.h"
 
-template<typename T>
+template<bool add>
+inline float soft_max_load(device const float * src, device const float * other, int i) {
+    if (add) {
+        #pragma METAL fp math_mode(safe)
+        #pragma METAL fp contract(off)
+        // The separate ADD rounds to float before softmax scales the sum.
+        return src[i] + other[i];
+    }
+    return src[i];
+}
+
+template<bool add>
+inline float4 soft_max_load4(device const float4 * src, device const float * other, int i) {
+    if (add) {
+        #pragma METAL fp math_mode(safe)
+        #pragma METAL fp contract(off)
+        // Relative-position rows need only float alignment, including at widths divisible by four.
+        return src[i] + float4(other[4*i], other[4*i + 1], other[4*i + 2], other[4*i + 3]);
+    }
+    return src[i];
+}
+
+template<typename T, bool add = false>
 kernel void kernel_soft_max(
         constant ggml_metal_kargs_soft_max & args,
         device const  char * src0,
@@ -22,7 +44,8 @@ kernel void kernel_soft_max(
     const int32_t i11 = i01;
 
     device const float * psrc0 =                (device const float *) (src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
-    device const     T * pmask = src1 != src0 ? (device const T *    ) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
+    device const     T * pmask = !add && src1 != src0 ? (device const T *) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
+    device const float * padd  = add ? (device const float *) (src1 + i01*args.nb11 + i02*args.nb12 + i03*args.nb13) : nullptr;
     device const float * psrc2 = src2 != src0 ? (device const float *) (src2)                                                 : nullptr;
     device       float * pdst  =                (device       float *) (dst  + i01*args.nb1  + i02*args.nb2  + i03*args.nb3);
 
@@ -42,7 +65,7 @@ kernel void kernel_soft_max(
     float lmax = psrc2 ? psrc2[i02] : -INFINITY;
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += tptg.x) {
-        lmax = MAX(lmax, psrc0[i00]*args.scale + (pmask ? slope*pmask[i00] : 0.0f));
+        lmax = MAX(lmax, soft_max_load<add>(psrc0, padd, i00)*args.scale + (pmask ? slope*pmask[i00] : 0.0f));
     }
 
     // find the max value in the block
@@ -67,7 +90,7 @@ kernel void kernel_soft_max(
     // parallel sum
     float lsum = 0.0f;
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += tptg.x) {
-        const float exp_psrc0 = exp((psrc0[i00]*args.scale + (pmask ? slope*pmask[i00] : 0.0f)) - max_val);
+        const float exp_psrc0 = exp((soft_max_load<add>(psrc0, padd, i00)*args.scale + (pmask ? slope*pmask[i00] : 0.0f)) - max_val);
         lsum += exp_psrc0;
         pdst[i00] = exp_psrc0;
     }
@@ -106,7 +129,7 @@ kernel void kernel_soft_max(
     }
 }
 
-template<typename T>
+template<typename T, bool add = false>
 kernel void kernel_soft_max_4(
         constant ggml_metal_kargs_soft_max & args,
         device const  char * src0,
@@ -128,7 +151,8 @@ kernel void kernel_soft_max_4(
     const int32_t i11 = i01;
 
     device const float4 * psrc4 =                (device const float4 *) (src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
-    device const      T * pmask = src1 != src0 ? (device const T *     ) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
+    device const      T * pmask = !add && src1 != src0 ? (device const T *) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
+    device const float * padd  = add ? (device const float *) (src1 + i01*args.nb11 + i02*args.nb12 + i03*args.nb13) : nullptr;
     device const float *  psrc2 = src2 != src0 ? (device const float * ) (src2)                                                 : nullptr;
     device       float4 * pdst4 =                (device       float4 *) (dst  + i01*args.nb1  + i02*args.nb2  + i03*args.nb3);
 
@@ -147,7 +171,7 @@ kernel void kernel_soft_max_4(
     float4 lmax4 = psrc2 ? psrc2[i02] : -INFINITY;
 
     for (int i00 = tpitg.x; i00 < args.ne00/4; i00 += tptg.x) {
-        lmax4 = fmax(lmax4, psrc4[i00]*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f)));
+        lmax4 = fmax(lmax4, soft_max_load4<add>(psrc4, padd, i00)*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f)));
     }
 
     const float lmax = MAX(MAX(lmax4[0], lmax4[1]), MAX(lmax4[2], lmax4[3]));
@@ -173,7 +197,7 @@ kernel void kernel_soft_max_4(
     // parallel sum
     float4 lsum4 = 0.0f;
     for (int i00 = tpitg.x; i00 < args.ne00/4; i00 += tptg.x) {
-        const float4 exp_psrc4 = exp((psrc4[i00]*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f))) - max_val);
+        const float4 exp_psrc4 = exp((soft_max_load4<add>(psrc4, padd, i00)*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f))) - max_val);
         lsum4 += exp_psrc4;
         pdst4[i00] = exp_psrc4;
     }
@@ -221,3 +245,5 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+template [[host_name("kernel_soft_max_add_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float, true>;
+template [[host_name("kernel_soft_max_add_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4, true>;

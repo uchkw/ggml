@@ -87,7 +87,7 @@ struct ggml_metal_op {
         assert(use_fusion());
         assert(i0 >= 0 && i0 < n_nodes());
 
-        return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
+        return ggml_metal_fusion_next(ggml_metal_device_get_props(dev), gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
     }
 
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
@@ -1563,10 +1563,10 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
+static int ggml_metal_op_soft_max_impl(ggml_metal_op_t ctx, int idx, bool fuse_add) {
     ggml_tensor * op = ctx->node(idx);
 
-    if (ctx->use_fusion()) {
+    if (!fuse_add && ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TOPK_MOE) {
@@ -1577,10 +1577,13 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    const ggml_tensor * src0 = fuse_add ? op->src[0]->src[0] : op->src[0];
+    const ggml_tensor * src1 = fuse_add ? op->src[0]->src[1] : op->src[1];
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, src0, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, src0, nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, src1, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, src1, nb);
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
@@ -1623,7 +1626,7 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
         /*.n_head_log2 =*/ n_head_log2,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_soft_max(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_soft_max(lib, op, fuse_add);
 
     int nth = 32; // SIMD width
 
@@ -1641,16 +1644,16 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    if (op->src[1]) {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src0), 1);
+    if (src1) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src1), 2);
     } else {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 2);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src0), 2);
     }
     if (op->src[2]) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[2]), 3);
     } else {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src0), 3);
     }
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
 
@@ -1659,6 +1662,10 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return 1;
+}
+
+int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_soft_max_impl(ctx, idx, false);
 }
 
 int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
@@ -4165,6 +4172,15 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         int n = 1;
         fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         n_fuse = n;
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_ADD_SOFT_MAX) {
+            ctx->count_fusions(fusion);
+            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + 1))) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+            ggml_metal_op_soft_max_impl(ctx, idx + 1, true);
+            return n_fuse;
+        }
 
         // snake activation autofuse: mul -> sin -> sqr -> mul -> add
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {
