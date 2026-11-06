@@ -3079,6 +3079,19 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_norm_mul_add_fusion = false;
+static bool ggml_cpu_norm_mul_add_fusion_trace = false;
+
+static bool ggml_cpu_bool_env(const char * name) {
+    const char * value = getenv(name);
+    if (value == NULL || strcmp(value, "0") == 0) {
+        return false;
+    }
+    if (strcmp(value, "1") == 0) {
+        return true;
+    }
+    GGML_ABORT("%s must be 0 or 1", name);
+}
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3091,6 +3104,38 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (ggml_cpu_norm_mul_add_fusion && cplan->abort_callback == NULL && node->op == GGML_OP_NORM) {
+        const enum ggml_op fuse_ops[] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 3)) {
+            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * add_node = cgraph->nodes[node_n + 2];
+            const struct ggml_tensor * tensors[] = {
+                node->src[0], node, mul_node->src[0], mul_node->src[1], mul_node,
+                add_node->src[0], add_node->src[1], add_node,
+            };
+            bool eligible = node->ne[0] > 0;
+            for (size_t i = 0; eligible && i < sizeof(tensors) / sizeof(tensors[0]); ++i) {
+                eligible = tensors[i]->type == GGML_TYPE_F32 && ggml_is_vector(tensors[i]) &&
+                    ggml_is_contiguous(tensors[i]) && ggml_are_same_shape(node, tensors[i]);
+            }
+            if (eligible) {
+                // One row belongs to thread zero in all three kernels. Their separate stores and existing
+                // arithmetic are retained, including Accelerate's normalization, multiplication and addition.
+                if (params->ith == 0) {
+                    ggml_compute_forward_norm(params, node);
+                    ggml_compute_forward_mul(params, mul_node);
+                    ggml_compute_forward_add(params, add_node);
+                    if (ggml_cpu_norm_mul_add_fusion_trace) {
+                        const struct ggml_tensor * bias = add_node->src[0] == mul_node ? add_node->src[1] : add_node->src[0];
+                        GGML_LOG_INFO("ggml_cpu_norm_mul_add_fusion: node=%d width=%" PRId64 " bias=%s\n",
+                                      node_n, node->ne[0], bias->name);
+                    }
+                }
+                return 2;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3949,6 +3994,8 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            ggml_cpu_norm_mul_add_fusion = ggml_cpu_bool_env("GGML_CPU_NORM_MUL_ADD_FUSION");
+            ggml_cpu_norm_mul_add_fusion_trace = ggml_cpu_bool_env("GGML_CPU_NORM_MUL_ADD_FUSION_TRACE");
         }
 
         is_first_call = false;
