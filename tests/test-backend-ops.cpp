@@ -6374,6 +6374,8 @@ struct test_add_soft_max_relpos : public test_case {
         ggml_tensor * a = ac;
         if (variant == "padded_ac") {
             a = ggml_view_3d(ctx, ac, t, rows, heads, ac->nb[1], ac->nb[2], sizeof(float));
+        } else if (variant == "view_ac") {
+            a = ggml_view_tensor(ctx, ac);
         }
         ggml_tensor * b = ggml_view_3d(ctx, bd, t, rows, heads,
             (2*t - 2)*ggml_type_size(type), bd->nb[2], (t - 1)*ggml_type_size(type));
@@ -6408,7 +6410,9 @@ struct test_add_soft_max_relpos : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            init_tensor_uniform(tensor, 0.125f, 0.125f);
+        }
         for (ggml_tensor * tensor : {ac, bd}) {
             std::vector<float> data(ggml_nelements(tensor));
             for (size_t i = 0; i < data.size(); ++i) {
@@ -6438,7 +6442,7 @@ static std::vector<std::unique_ptr<test_add_soft_max_relpos>> make_add_soft_max_
             cases.emplace_back(new test_add_soft_max_relpos(t, 8, extreme));
         }
     }
-    for (const char * variant : {"contiguous", "broadcast", "wrong_stride", "padded_ac", "swapped",
+    for (const char * variant : {"contiguous", "broadcast", "wrong_stride", "padded_ac", "view_ac", "swapped",
                                 "rectangular", "f16", "mask", "sinks", "inplace", "output", "reuse", "consumer"}) {
         cases.emplace_back(new test_add_soft_max_relpos(32, 3, false, variant));
     }
@@ -13131,6 +13135,31 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
     if (!get || !init || !reset || !stats || !token || strcmp(token(dev), "GGML_METAL_DEVICE_M2_ULTRA") != 0) {
         return true;
     }
+    const char * expected = getenv("GGML_TEST_ADD_SOFTMAX_EXPECT");
+    if (expected && strcmp(expected, "0") != 0 && strcmp(expected, "1") != 0) {
+        printf("GGML_TEST_ADD_SOFTMAX_EXPECT must be 0 or 1\n");
+        return false;
+    }
+    const bool expect_enabled = !expected || strcmp(expected, "1") == 0;
+    std::ofstream dump;
+    if (const char * path = getenv("GGML_TEST_ADD_SOFTMAX_DUMP")) {
+        if (std::ifstream(path).good()) {
+            printf("ADD_SOFT_MAX_RELPOS dump already exists: %s\n", path);
+            return false;
+        }
+        dump.open(path, std::ios::binary);
+        if (!dump) {
+            printf("Cannot create ADD_SOFT_MAX_RELPOS dump: %s\n", path);
+            return false;
+        }
+    }
+    auto write_dump = [&](const void * data, size_t size) {
+        if (dump.is_open()) {
+            const uint64_t n = size;
+            dump.write((const char *) &n, sizeof(n));
+            dump.write((const char *) data, size);
+        }
+    };
     void * finfo = get(dev);
     init(finfo);
     ggml_backend_ptr exact_backend(ggml_backend_dev_init(dev, nullptr));
@@ -13158,6 +13187,13 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
         checked.push_back(out);
         for (tc->generation = 0; tc->generation < 2; ++tc->generation) {
             tc->initialize_tensors(ctx.get());
+            const std::string name = tc->vars();
+            write_dump(name.data(), name.size());
+            for (ggml_tensor * input : {tc->ac, tc->bd}) {
+                std::vector<uint8_t> bytes(ggml_nbytes(input));
+                ggml_backend_tensor_get(input, bytes.data(), 0, bytes.size());
+                write_dump(bytes.data(), bytes.size());
+            }
             std::vector<uint8_t> reference;
             for (bool enabled : {false, true}) {
                 setenv("GGML_METAL_ADD_SOFTMAX", enabled ? "1" : "0", 1);
@@ -13186,7 +13222,7 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
                         fused += counts[i];
                     }
                 }
-                same = same && fused == (enabled && tc->expects_fusion() ? 1u : 0u);
+                same = same && fused == (enabled && expect_enabled && tc->expects_fusion() ? 1u : 0u);
                 std::vector<uint8_t> actual;
                 for (ggml_tensor * tensor : checked) {
                     const std::vector<float> values = tensor_to_float(tensor);
@@ -13200,6 +13236,7 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
                 } else {
                     reference = actual;
                 }
+                write_dump(actual.data(), actual.size());
                 if (!same) {
                     printf("  FAIL ADD_SOFT_MAX_RELPOS exact (%s,generation=%d,enabled=%d,fused=%llu)\n",
                            tc->vars().c_str(), tc->generation, (int) enabled, (unsigned long long) fused);
@@ -13214,7 +13251,12 @@ static bool run_add_soft_max_relpos_exact(ggml_backend_t backend, const char * o
     } else {
         unsetenv("GGML_METAL_ADD_SOFTMAX");
     }
-    printf("  ADD_SOFT_MAX_RELPOS exact: %d poisoned executions, %s\n", n_run, ok ? "OK" : "FAIL");
+    if (dump.is_open()) {
+        dump.flush();
+        ok = ok && dump.good();
+    }
+    printf("  ADD_SOFT_MAX_RELPOS exact: %d poisoned executions, expect_fusion=%d, %s\n",
+           n_run, (int) expect_enabled, ok ? "OK" : "FAIL");
     return ok;
 #else
     GGML_UNUSED(backend);
