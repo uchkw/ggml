@@ -7773,7 +7773,9 @@ struct test_mul_mat_silu : public test_case {
         const int64_t batch = variant == "batch" ? 2 : 1;
         ggml_tensor * a = ggml_new_tensor_3d(ctx, c.type, c.k, c.m + (variant == "offset"), batch);
         ggml_tensor * b = variant == "transpose" ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n, c.k) :
-            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k + (variant == "stride" ? 4 : 0), c.n + (variant == "offset"), batch);
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k + (variant == "stride" ? 4 : 0),
+                               variant == "alias" ? c.n*c.m/c.k : c.n + (variant == "offset"), batch);
+        ggml_tensor * bbase = b;
         if (variant == "offset") {
             a = ggml_view_2d(ctx, a, c.k, c.m, a->nb[1], a->nb[1]);
             b = ggml_view_2d(ctx, b, c.k, c.n, b->nb[1], b->nb[1]);
@@ -7781,6 +7783,8 @@ struct test_mul_mat_silu : public test_case {
             b = ggml_view_2d(ctx, b, c.k, c.n, b->nb[1], 0);
         } else if (variant == "transpose") {
             b = ggml_transpose(ctx, b);
+        } else if (variant == "alias") {
+            b = ggml_view_2d(ctx, b, c.k, c.n, c.k*sizeof(float), 0);
         }
         mm = ggml_mul_mat(ctx, a, b);
         ggml_prec_set_acc(mm, GGML_PREC_F32);
@@ -7788,6 +7792,11 @@ struct test_mul_mat_silu : public test_case {
         if (variant == "output") ggml_set_output(mm);
         result = variant == "inplace" ? ggml_silu_inplace(ctx, mm) :
                  variant == "relu" ? ggml_relu(ctx, mm) : ggml_silu(ctx, mm);
+        if (variant == "alias") {
+            // The separate unary operation may reuse the input after the product finishes.
+            result->view_src = bbase;
+            result->view_offs = 0;
+        }
         if (variant == "reuse") result = ggml_add(ctx, result, mm);
         if (variant == "consumer") result = ggml_scale(ctx, result, 0.5f);
         ggml_set_name(result, "out");
