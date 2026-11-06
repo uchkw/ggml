@@ -955,17 +955,18 @@ static int ggml_metal_mul_mm_tensor_nr1(const ggml_tensor * op) {
 // The experiment keeps the same operands and K steps and changes only the columns computed by a simdgroup tile.
 static int ggml_metal_mul_mm_simdgroup_nr1(const ggml_tensor * op) {
     const char * setting = std::getenv("GGML_METAL_MM_TILE_N");
-    GGML_ASSERT(setting == nullptr || std::strcmp(setting, "32") == 0 || std::strcmp(setting, "64") == 0);
+    GGML_ASSERT(setting == nullptr || std::strcmp(setting, "16") == 0 || std::strcmp(setting, "32") == 0 || std::strcmp(setting, "64") == 0);
     if (setting == nullptr || std::strcmp(setting, "32") == 0) {
         return 32;
     }
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
     const int64_t m = op->ne[0], k = a->ne[0];
-    const bool shape = (m == 4096 && k == 1024) || (m == 1024 && (k == 4096 || k == 1024));
+    const int columns = std::strcmp(setting, "16") == 0 ? 16 : 64;
+    const bool shape = (columns == 64 && m == 4096 && k == 1024) || (m == 1024 && (k == 4096 || k == 1024));
     return shape && op->ne[1] > 16 && (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_Q8_0) &&
            b->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
-           a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 ? 64 : 32;
+           a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 ? columns : 32;
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
@@ -1007,6 +1008,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
         ggml_metal_cv_set_bool(cv, nr1 == 64, FC_MUL_MM + 8);
+        if (!has_tensor) {
+            ggml_metal_cv_set_bool(cv, nr1 == 16, FC_MUL_MM + 9);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

@@ -5410,7 +5410,7 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// These products cover the encoder's dense projections and the last tiles of both 32 and 64 columns.
+// These products cover the encoder's dense projections and the last tiles of 16, 32 and 64 columns.
 struct test_mul_mat_simdgroup_tile : public test_mul_mat {
     test_mul_mat_simdgroup_tile(ggml_type type_a, int64_t m, int64_t n, int64_t k)
         : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
@@ -11006,7 +11006,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (const auto & mk : {std::array<int64_t, 2>{4096, 1024}, {1024, 4096}, {1024, 1024}}) {
-            for (int n : {17, 31, 32, 33, 38, 63, 64, 65, 75, 96, 97, 125, 127, 128, 129, 171, 172, 250, 341, 375, 749}) {
+            for (int n : {15, 16, 17, 31, 32, 33, 38, 47, 48, 49, 63, 64, 65, 75, 96, 97, 125, 127, 128, 129, 171, 172, 250, 341, 375, 749}) {
                 test_cases.emplace_back(new test_mul_mat_simdgroup_tile(type, mk[0], n, mk[1]));
             }
         }

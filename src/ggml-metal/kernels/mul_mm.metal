@@ -10,6 +10,7 @@ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 constant bool FC_mul_mm_nr1_64 [[function_constant(FC_MUL_MM + 8)]];
+constant bool FC_mul_mm_nr1_16 [[function_constant(FC_MUL_MM + 9)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -192,7 +193,7 @@ void kernel_mul_mm_simdgroup_impl(
     constexpr int NR0 = 64;
 
     constexpr int NK  = 32;
-    constexpr int NB  = NR1/32;
+    constexpr int NB  = NR1 < 32 ? 1 : NR1/32;
     constexpr int NC  = NR1/16;
 
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
@@ -291,17 +292,20 @@ void kernel_mul_mm_simdgroup_impl(
         FOR_UNROLL (short j = 0; j < NB; ++j) {
             const short sx = (tiitg%NL1);
             const short row = tiitg/NL1 + j*32;
-            const short sy = row/8;
-            const short ly = row%8;
-            const short ib = (NR1/8)*sx + sy;
-            if (FC_mul_mm_bc_inp) {
-                for (short i = 0; i < 8; ++i) {
-                    *(sb + 64*ib + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y[j] + i) : 0;
+            // A 16-column tile uses only the first 64 threads to stage B; every thread still stages A and reaches the barriers.
+            if (NR1 >= 32 || row < NR1) {
+                const short sy = row/8;
+                const short ly = row%8;
+                const short ib = (NR1/8)*sx + sy;
+                if (FC_mul_mm_bc_inp) {
+                    for (short i = 0; i < 8; ++i) {
+                        *(sb + 64*ib + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y[j] + i) : 0;
+                    }
+                } else {
+                    *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y[j]));
                 }
-            } else {
-                *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y[j]));
+                y[j] += NK;
             }
-            y[j] += NK;
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -394,7 +398,9 @@ kernel void kernel_mul_mm(
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    if (FC_mul_mm_nr1_64) {
+    if (FC_mul_mm_nr1_16) {
+        kernel_mul_mm_simdgroup_impl<16, S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(args, src0, src1, dst, shmem, tgpig, tiitg, sgitg);
+    } else if (FC_mul_mm_nr1_64) {
         kernel_mul_mm_simdgroup_impl<64, S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(args, src0, src1, dst, shmem, tgpig, tiitg, sgitg);
     } else {
         kernel_mul_mm_simdgroup_impl<32, S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(args, src0, src1, dst, shmem, tgpig, tiitg, sgitg);
