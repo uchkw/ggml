@@ -41,6 +41,11 @@ static std::vector<dw_silu_case> dw_silu_cases() {
     // The CPU channel-fastest convolution reads packed rows without consulting the input strides.
     cases.push_back({1024, 33, GGML_TYPE_F32, "strided_input", false, false});
     cases.push_back({1, 33, GGML_TYPE_F32, "plain", false, true});
+    for (const char * variant : {"mapped_input", "mapped_partial_input", "mapped_kernel", "mapped_partial_kernel",
+                                 "mapped_bias", "mapped_partial_bias"}) {
+        cases.push_back({1024, 33, GGML_TYPE_F32, variant, false, false});
+    }
+    cases.push_back({1024, 33, GGML_TYPE_F32, "mapped_disjoint", true, false});
     return cases;
 }
 

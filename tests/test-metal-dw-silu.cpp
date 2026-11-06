@@ -9,10 +9,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <unistd.h>
 
 using Context = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 using Buffer = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
@@ -165,6 +167,45 @@ static void check_poison_guard(ggml_backend_t backend) {
     }
 }
 
+/** Separate Metal mappings of one host arena expose aliases hidden by distinct buffer identities. */
+struct MappedArena {
+    std::unique_ptr<void, decltype(&std::free)> host{nullptr, std::free};
+    Buffer first{nullptr, ggml_backend_buffer_free};
+    Buffer second{nullptr, ggml_backend_buffer_free};
+
+    void allocate(ggml_backend_t backend, const dw_silu_graph & t, const std::string & variant) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) throw std::runtime_error("cannot obtain the host page size");
+        const size_t largest = std::max({ggml_nbytes(t.input_storage), ggml_nbytes(t.weight_storage),
+                                         ggml_nbytes(t.bias_storage), ggml_nbytes(t.activation)});
+        const size_t stride = ((largest + 16 + page - 1)/page)*page;
+        const size_t size = 4*stride;
+        void * data = nullptr;
+        if (posix_memalign(&data, (size_t) page, size) != 0) throw std::runtime_error("cannot allocate the mapped depthwise arena");
+        host.reset(data);
+        const auto device = ggml_backend_get_device(backend);
+        first.reset(ggml_backend_dev_buffer_from_host_ptr(device, data, size, largest));
+        second.reset(ggml_backend_dev_buffer_from_host_ptr(device, data, size, largest));
+        if (!first || !second || !first->context || !second->context || first->context == second->context) {
+            throw std::runtime_error("cannot create two distinct Metal mappings of the depthwise arena");
+        }
+        const std::vector<ggml_tensor *> roots{t.input_storage, t.weight_storage, t.bias_storage, t.activation};
+        for (size_t i = 0; i < roots.size(); i++) {
+            size_t offset = i*stride;
+            if (i == 3) {
+                if (variant.find("input") != std::string::npos) offset = 0;
+                if (variant.find("kernel") != std::string::npos) offset = stride;
+                if (variant.find("bias") != std::string::npos) offset = 2*stride;
+                if (variant.find("partial") != std::string::npos) offset += sizeof(float);
+            }
+            if (ggml_backend_tensor_alloc(i == 3 ? second.get() : first.get(), roots[i],
+                    static_cast<char *>(data) + offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("cannot bind the mapped depthwise tensor");
+            }
+        }
+    }
+};
+
 static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_silu_case & c, bool expected) {
     constexpr int graph_size = 64;
     ggml_init_params params{ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(graph_size, false), nullptr, true};
@@ -175,8 +216,15 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
     ggml_build_forward_expand(graph, t.bias);
     ggml_build_forward_expand(graph, t.out);
     const size_t allocation_dependencies = optimize(backend, graph);
+    const bool mapped = std::string(c.variant).find("mapped_") == 0;
+    MappedArena arena;
+    if (mapped) arena.allocate(backend, t, c.variant);
     Buffer buffer(ggml_backend_alloc_ctx_tensors(context.get(), backend), ggml_backend_buffer_free);
     if (!buffer) throw std::runtime_error("cannot allocate the test tensors");
+    if (mapped && (t.activation->buffer == t.input->buffer || t.activation->buffer == t.kernel->buffer ||
+                   t.activation->buffer == t.bias->buffer)) {
+        throw std::runtime_error("the mapped output does not use a separate buffer wrapper");
+    }
     std::vector<ggml_tensor *> protected_tensors;
     for (auto * tensor : {t.conv, t.sum}) {
         if (tensor->flags & GGML_TENSOR_FLAG_OUTPUT) protected_tensors.push_back(tensor);
@@ -221,7 +269,7 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
     const bool ok = values_finite && different == 0 && protected_equal && inputs_unchanged && all_values_cleared &&
                     disabled_count == 0 && enabled_count == want && allocation_dependencies == 0;
     std::printf("{\"kind\":\"comparison\",\"weight_type\":\"%s\",\"channels\":%lld,\"frames\":%lld,\"variant\":\"%s\","
-                "\"cpu_reference_case\":%s,\"same_input_buffers\":true,\"outputs_poisoned_before_each_run\":true,"
+                "\"cpu_reference_case\":%s,\"mapped_arena\":%s,\"same_input_buffers\":true,\"outputs_poisoned_before_each_run\":true,"
                 "\"inputs_unchanged\":%s,\"all_output_values_cleared_before_candidate\":%s,"
                 "\"graph_optimized\":true,\"allocation_dependencies\":%zu,"
                 "\"input_fnv1a64\":\"%016llx\",\"weight_fnv1a64\":\"%016llx\",\"bias_fnv1a64\":\"%016llx\","
@@ -229,7 +277,8 @@ static bool run_case(ggml_backend_t backend, const Fusion & fusion, const dw_sil
                 "\"disabled_fusions\":%llu,\"enabled_fusions\":%llu,\"expected_fusions\":%llu,"
                 "\"different_values\":%zu,\"max_abs\":%.17g,\"finite\":%s,\"protected_intermediates_equal\":%s,\"passed\":%s}\n",
                 ggml_type_name(c.weight_type), (long long) c.channels, (long long) c.frames, c.variant,
-                c.cpu_reference ? "true" : "false", inputs_unchanged ? "true" : "false", all_values_cleared ? "true" : "false",
+                c.cpu_reference ? "true" : "false", mapped ? "true" : "false", inputs_unchanged ? "true" : "false",
+                all_values_cleared ? "true" : "false",
                 allocation_dependencies, (unsigned long long) input_hash, (unsigned long long) weight_hash,
                 (unsigned long long) bias_hash, (unsigned long long) baseline_hash, (unsigned long long) hash(bytes(t.out)),
                 (unsigned long long) disabled_count, (unsigned long long) enabled_count, (unsigned long long) want,
