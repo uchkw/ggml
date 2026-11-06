@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -3697,6 +3698,131 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+// A Conformer block ends in a same-shape residual followed by affine layer normalization.
+struct test_residual_norm : public test_case {
+    const int64_t t;
+    const int distribution;
+    const std::string variant;
+    int generation = 0;
+    ggml_tensor * a = nullptr;
+    ggml_tensor * b = nullptr;
+    ggml_tensor * weight = nullptr;
+    ggml_tensor * bias = nullptr;
+    ggml_tensor * residual = nullptr;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * mul = nullptr;
+    ggml_tensor * affine = nullptr;
+    ggml_tensor * alias_storage = nullptr;
+
+    test_residual_norm(int64_t t, int distribution = 0, std::string variant = "plain")
+        : t(t), distribution(distribution), variant(std::move(variant)) {}
+
+    std::string op_desc(ggml_tensor *) override { return "RESIDUAL_NORM"; }
+    std::string vars() override { return VARS_TO_STR3(t, distribution, variant); }
+    bool run_whole_graph() override { return true; }
+
+    bool expects_fusion() const {
+        return variant == "plain" || variant == "alias_a" || variant == "alias_b" ||
+               variant == "alias_residual" || variant == "same_inputs";
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (variant == "output_residual") return {residual, affine};
+        if (variant == "output_norm") return {norm, affine};
+        if (variant == "output_mul") return {mul, affine};
+        return {};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = variant == "width" ? 1025 : 1024;
+        const ggml_type type = variant == "f16" ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        a = ggml_new_tensor_2d(ctx, type, width + (variant == "strided" ? 4 : 0), t);
+        b = variant == "same_inputs" ? a : ggml_new_tensor_2d(ctx, type, width, variant == "broadcast" ? 1 : t);
+        weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, variant == "row_weight" ? t : 1);
+        bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(a, "residual_a");
+        ggml_set_name(b, "residual_b");
+        ggml_set_name(weight, "norm_weight");
+        ggml_set_name(bias, "norm_bias");
+        ggml_tensor * input = variant == "strided" ? ggml_view_2d(ctx, a, width, t, a->nb[1], 0) : a;
+        residual = ggml_add(ctx, input, b);
+        input = type == GGML_TYPE_F16 ? ggml_cast(ctx, residual, GGML_TYPE_F32) : residual;
+        norm = ggml_norm(ctx, input, 1e-5f);
+        mul = ggml_mul(ctx, norm, weight);
+        affine = ggml_add(ctx, mul, bias);
+        ggml_set_name(residual, "residual");
+        ggml_set_name(norm, "norm");
+        ggml_set_name(mul, "norm_mul");
+        ggml_set_name(affine, "affine");
+        if (variant == "output_residual") ggml_set_output(residual);
+        if (variant == "output_norm") ggml_set_output(norm);
+        if (variant == "output_mul") ggml_set_output(mul);
+        if (variant == "partial_a") {
+            alias_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(a) + 4);
+        }
+        if (variant == "reuse_residual") return ggml_add(ctx, affine, residual);
+        if (variant == "reuse_norm") return ggml_add(ctx, affine, norm);
+        if (variant == "reuse_mul") return ggml_add(ctx, affine, mul);
+        return affine;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            init_tensor_uniform(tensor, 0.125f, 0.125f);
+        }
+        for (ggml_tensor * tensor : {a, b, weight, bias}) {
+            std::vector<float> data(ggml_nelements(tensor));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const int64_t row = i / tensor->ne[0];
+                const int64_t col = i % tensor->ne[0];
+                const int64_t key = 17*col + 29*row + 13*generation;
+                if (tensor == weight) {
+                    data[i] = 0.25f + (float) (key % 31) * 0.03125f;
+                } else if (tensor == bias) {
+                    data[i] = (float) (key % 23 - 11) * 0.015625f;
+                } else if (distribution == 1) {
+                    // Half-ULP addends expose a reassociation across the residual's F32 rounding.
+                    data[i] = tensor == a ? (key % 2 ? 1.0f : -1.0f) :
+                        (float) (key % 7 - 3) * std::ldexp(1.0f, -24);
+                } else if (distribution == 2) {
+                    data[i] = (float) ((key + (tensor == a ? 7 : 19)) % 127 - 63) * 1024.125f;
+                } else if (distribution == 3) {
+                    // Dyadic perturbations keep a nearly constant row's mean exactly representable.
+                    data[i] = (tensor == a ? 1.0f : -0.875f) + (float) (key % 16 - 8) * 0.000244140625f;
+                } else {
+                    data[i] = (float) ((key + (tensor == a ? 7 : 19)) % 127 - 63) *
+                        (tensor == a ? 0.1234567f : 0.07654321f);
+                }
+            }
+            if (tensor->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> half(data.size());
+                ggml_fp32_to_fp16_row(data.data(), half.data(), (int64_t) data.size());
+                ggml_backend_tensor_set(tensor, half.data(), 0, half.size()*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
+static std::vector<std::unique_ptr<test_residual_norm>> make_residual_norm_cases() {
+    std::vector<std::unique_ptr<test_residual_norm>> cases;
+    for (int64_t t : {1, 31, 32, 33, 100, 171, 172, 375}) {
+        for (int distribution : {0, 1, 2, 3}) cases.emplace_back(new test_residual_norm(t, distribution));
+    }
+    for (int64_t t : {1, 33, 375}) {
+        for (const char * variant : {"alias_a", "alias_b", "alias_residual", "same_inputs"}) {
+            cases.emplace_back(new test_residual_norm(t, 1, variant));
+        }
+    }
+    for (const char * variant : {"width", "strided", "broadcast", "row_weight", "f16", "output_residual",
+                                "output_norm", "output_mul", "reuse_residual", "reuse_norm", "reuse_mul",
+                                "partial_a", "wrapper_a", "wrapper_weight"}) {
+        cases.emplace_back(new test_residual_norm(33, 0, variant));
+    }
+    return cases;
+}
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -10704,6 +10830,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
+    for (auto & test : make_residual_norm_cases()) {
+        test_cases.emplace_back(std::move(test));
+    }
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
             for (bool v : { false, true }) {
@@ -12998,6 +13128,208 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+static bool run_residual_norm_exact(ggml_backend_t backend, const char * op_names_filter) {
+#if defined(__APPLE__)
+    if (!op_names_filter_selects(op_names_filter, "RESIDUAL_NORM")) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using get_t = void * (*)(ggml_backend_dev_t);
+    using init_t = void (*)(void *);
+    using stats_t = int (*)(void *, const char **, uint64_t *, int);
+    using token_t = const char * (*)(ggml_backend_dev_t);
+    auto get = (get_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
+    auto init = (init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
+    auto reset = (init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_reset");
+    auto stats = (stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
+    auto token = (token_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_tuning_device_token");
+    if (!get || !init || !reset || !stats || !token || strcmp(token(dev), "GGML_METAL_DEVICE_M2_ULTRA") != 0) {
+        return true;
+    }
+    const char * expected = getenv("GGML_TEST_RESIDUAL_NORM_EXPECT");
+    if (expected && strcmp(expected, "0") != 0 && strcmp(expected, "1") != 0) {
+        printf("GGML_TEST_RESIDUAL_NORM_EXPECT must be 0 or 1\n");
+        return false;
+    }
+    const bool expect_enabled = !expected || strcmp(expected, "1") == 0;
+    std::ofstream dump;
+    if (const char * path = getenv("GGML_TEST_RESIDUAL_NORM_DUMP")) {
+        if (std::ifstream(path).good()) {
+            printf("RESIDUAL_NORM dump already exists: %s\n", path);
+            return false;
+        }
+        dump.open(path, std::ios::binary);
+        if (!dump) {
+            printf("Cannot create RESIDUAL_NORM dump: %s\n", path);
+            return false;
+        }
+    }
+    auto write_dump = [&](const void * data, size_t size) {
+        if (dump.is_open()) {
+            const uint64_t n = size;
+            dump.write((const char *) &n, sizeof(n));
+            dump.write((const char *) data, size);
+        }
+    };
+    void * finfo = get(dev);
+    init(finfo);
+    ggml_backend_ptr exact_backend(ggml_backend_dev_init(dev, nullptr));
+    if (!exact_backend) {
+        return false;
+    }
+    const char * previous = getenv("GGML_METAL_RESIDUAL_NORM");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    bool ok = true;
+    int n_run = 0;
+    for (auto & tc : make_residual_norm_cases()) {
+        tc->mode = MODE_TEST;
+        ggml_init_params params = { ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(256, false), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 256, false);
+        ggml_tensor * out = tc->build_graph(ctx.get());
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), exact_backend.get()));
+        if (!buffer) {
+            ok = false;
+            break;
+        }
+        std::vector<uint8_t> host_storage;
+        ggml_backend_buffer_ptr mapped;
+        ggml_backend_buffer_ptr wrapper;
+        if (tc->variant == "wrapper_a" || tc->variant == "wrapper_weight") {
+            const size_t size = ggml_backend_buffer_get_size(buffer.get());
+            host_storage.resize(size + 16384);
+            const uintptr_t address = ((uintptr_t) host_storage.data() + 16383) & ~(uintptr_t) 16383;
+            mapped.reset(ggml_backend_dev_buffer_from_host_ptr(dev, (void *) address, size, size));
+            wrapper.reset(ggml_backend_dev_buffer_from_host_ptr(dev, (void *) address, size, size));
+            if (!mapped || !wrapper) {
+                ok = false;
+                break;
+            }
+            const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(buffer.get());
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                tensor->data = (void *) (address + (uintptr_t) tensor->data - base);
+                tensor->buffer = mapped.get();
+            }
+            if (tc->variant == "wrapper_a") {
+                tc->a->buffer = wrapper.get();
+                out->data = tc->a->data;
+            } else {
+                tc->weight->data = tc->a->data;
+                tc->weight->buffer = wrapper.get();
+            }
+        }
+        const bool aliases_input = tc->variant == "alias_a" || tc->variant == "alias_b" ||
+                                   tc->variant == "partial_a" || tc->variant == "wrapper_a";
+        if (tc->alias_storage) {
+            tc->a->data = tc->alias_storage->data;
+            out->data = (char *) tc->a->data + 4*sizeof(float);
+        } else if (tc->variant == "alias_a") {
+            out->data = tc->a->data;
+        } else if (tc->variant == "alias_b") {
+            out->data = tc->b->data;
+        } else if (tc->variant == "alias_residual") {
+            out->data = tc->residual->data;
+        }
+        std::vector<ggml_tensor *> checked = tc->fusion_test_nodes();
+        checked.push_back(out);
+        for (tc->generation = 0; tc->generation < 2; ++tc->generation) {
+            tc->initialize_tensors(ctx.get());
+            const std::string name = tc->vars();
+            write_dump(name.data(), name.size());
+            std::vector<std::vector<uint8_t>> inputs;
+            for (ggml_tensor * input : {tc->a, tc->b, tc->weight, tc->bias}) {
+                std::vector<uint8_t> bytes(ggml_nbytes(input));
+                ggml_backend_tensor_get(input, bytes.data(), 0, bytes.size());
+                write_dump(bytes.data(), bytes.size());
+                inputs.emplace_back(std::move(bytes));
+            }
+            std::vector<uint8_t> reference;
+            for (bool enabled : {false, true}) {
+                setenv("GGML_METAL_RESIDUAL_NORM", enabled ? "1" : "0", 1);
+                for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                    if (tensor->op == GGML_OP_NONE || tensor->view_src) {
+                        continue;
+                    }
+                    std::vector<float> poison(ggml_nelements(tensor), std::numeric_limits<float>::quiet_NaN());
+                    if (tensor->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_set(tensor, poison.data(), 0, poison.size()*sizeof(float));
+                    } else if (tensor->type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> half(poison.size());
+                        ggml_fp32_to_fp16_row(poison.data(), half.data(), (int64_t) poison.size());
+                        ggml_backend_tensor_set(tensor, half.data(), 0, half.size()*sizeof(ggml_fp16_t));
+                    }
+                }
+                // Aliased output bytes are also inputs, so restore them after poisoning and before every execution.
+                size_t input_index = 0;
+                for (ggml_tensor * input : {tc->a, tc->b, tc->weight, tc->bias}) {
+                    const auto & bytes = inputs[input_index++];
+                    ggml_backend_tensor_set(input, bytes.data(), 0, bytes.size());
+                }
+                std::vector<uint8_t> before;
+                if (aliases_input) {
+                    before.resize(ggml_nbytes(out));
+                    ggml_backend_tensor_get(out, before.data(), 0, before.size());
+                }
+                reset(finfo);
+                bool same = ggml_backend_graph_compute(exact_backend.get(), graph) == GGML_STATUS_SUCCESS;
+                const int n = stats(finfo, nullptr, nullptr, 0);
+                std::vector<const char *> labels(n);
+                std::vector<uint64_t> counts(n);
+                stats(finfo, labels.data(), counts.data(), n);
+                uint64_t fused = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (strcmp(labels[i], "ADD+NORM+MUL+ADD") == 0) {
+                        fused += counts[i];
+                    }
+                }
+                same = same && fused == (enabled && expect_enabled && tc->expects_fusion() ? 1u : 0u);
+                std::vector<uint8_t> actual;
+                for (ggml_tensor * tensor : checked) {
+                    const std::vector<float> values = tensor_to_float(tensor);
+                    same = same && std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+                    const size_t offset = actual.size();
+                    actual.resize(offset + ggml_nbytes(tensor));
+                    ggml_backend_tensor_get(tensor, actual.data() + offset, 0, ggml_nbytes(tensor));
+                }
+                // A missing store must not pass by leaving the restored finite input in the output.
+                same = same && (!aliases_input || actual != before);
+                if (enabled) {
+                    same = same && actual == reference;
+                } else {
+                    reference = actual;
+                }
+                write_dump(actual.data(), actual.size());
+                if (!same) {
+                    printf("  FAIL RESIDUAL_NORM exact (%s,generation=%d,enabled=%d,fused=%llu)\n",
+                           tc->vars().c_str(), tc->generation, (int) enabled, (unsigned long long) fused);
+                    ok = false;
+                }
+                ++n_run;
+            }
+        }
+    }
+    if (had_previous) {
+        setenv("GGML_METAL_RESIDUAL_NORM", saved.c_str(), 1);
+    } else {
+        unsetenv("GGML_METAL_RESIDUAL_NORM");
+    }
+    if (dump.is_open()) {
+        dump.flush();
+        ok = ok && dump.good();
+    }
+    printf("  RESIDUAL_NORM exact: %d poisoned/restored executions, expect_fusion=%d, %s\n",
+           n_run, (int) expect_enabled, ok ? "OK" : "FAIL");
+    return ok;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(op_names_filter);
+    return true;
+#endif
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -13137,7 +13469,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        const bool residual_norm_ok = run_residual_norm_exact(backend, op_names_filter);
+        return n_ok == tests_run && slice_ok && residual_norm_ok;
     }
 
     if (mode == MODE_GRAD) {
