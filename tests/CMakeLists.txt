@@ -170,9 +170,9 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 if (APPLE AND GGML_METAL AND NOT GGML_BACKEND_DL)
     set(TEST_TARGET test-metal-bindings)
-    # the .m sources of the Metal backend also compile under the C rule, with the compiler
-    # reading Objective-C from the file extension, since nothing enables the OBJC language
-    set_source_files_properties(${TEST_TARGET}.m PROPERTIES LANGUAGE C)
+    # nothing enables the OBJC language, so the .m file follows the C compile rule and the
+    # compiler reads Objective-C from the extension, like the ggml-metal sources; an explicit
+    # LANGUAGE C would pass -x c under policy CMP0119 (CMake >= 3.20) and break Objective-C
     add_executable(${TEST_TARGET} ${TEST_TARGET}.m)
     target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-metal)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-metal "-framework Foundation" "-framework Metal")
