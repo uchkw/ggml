@@ -179,9 +179,11 @@ static void poison_guard(ggml_backend_t backend) {
     }
 }
 
-/** Two Metal mappings of one host arena: tensors bound through distinct buffer objects hide
- *  their raw overlap from every buffer-identity check, so these unsafe graphs must stay
- *  unfused and still match the ordinary run bit for bit. */
+/** Raw-placement arena for the Metal runner. The mapped mode creates two Metal mappings of one
+ *  host arena, so tensors bound through distinct buffer objects hide their raw overlap from
+ *  every buffer-identity check. The raw mode binds the whole triple into a single mapping, so
+ *  plain tensors alias exactly as placed and no wrapper identity can hide the overlap. Both
+ *  kinds of unsafe graph must stay unfused and still match the ordinary run bit for bit. */
 struct MappedArena {
     std::unique_ptr<void, decltype(&std::free)> host{nullptr, std::free};
     Buffer first{nullptr, ggml_backend_buffer_free};
@@ -215,6 +217,52 @@ struct MappedArena {
                     all[wrapped]->buffer != overlapped->buffer,
                 "the mapped GLU tensors do not overlap across wrappers");
     }
+
+    /** One mapping of the same host arena, with every GLU tensor (the weight may share it too)
+     *  bound into the single buffer object at explicit page-aligned slots. The sigmoid storage
+     *  lands exactly on the activation, 16 bytes into it, or exactly on the head of the F32
+     *  weight: plain tensor identities carry the alias, no view_src is forged. The trailing
+     *  add of the case reads the aliased input back after the product. */
+    void allocate_raw(ggml_backend_t backend, const mm_glu_graph & t, const std::string & variant) {
+        const long page = sysconf(_SC_PAGESIZE);
+        require(page > 0, "cannot obtain the host page size");
+        const size_t stride = ((ggml_nbytes(t.w_base) + 16 + (size_t) page - 1)/(size_t) page)*(size_t) page;
+        const size_t size = 7*stride;
+        void * data = nullptr;
+        require(posix_memalign(&data, (size_t) page, size) == 0, "cannot allocate the raw GLU arena");
+        host.reset(data);
+        const auto device = ggml_backend_get_device(backend);
+        first.reset(ggml_backend_dev_buffer_from_host_ptr(device, data, size, ggml_nbytes(t.w_base)));
+        require(first && first->context, "cannot create the single raw GLU buffer");
+        // slots: weight, activation, factor, gate product, sigmoid, final product, trailing add;
+        // the sigmoid gives up its own slot and lands on the aliased input instead, exactly or
+        // 16 bytes in, so the page padding of the input's slot absorbs the partial overhang
+        const std::vector<ggml_tensor *> all{t.w_base, t.x_base, t.a_base, t.mm, t.sigmoid, t.mul, t.out};
+        const size_t aliased = variant == "raw_sigmoid_w" ? 0 : 1;
+        const size_t shift = variant == "raw_sigmoid_x_partial" ? 16 : 0;
+        for (size_t i = 0; i < all.size(); ++i) {
+            const size_t offset = i == 4 ? aliased*stride + shift : i*stride;
+            require(ggml_backend_tensor_alloc(first.get(), all[i],
+                        static_cast<char *>(data) + offset) == GGML_STATUS_SUCCESS, "cannot bind the raw GLU tensor");
+        }
+        ggml_tensor * overlapped = aliased == 0 ? t.w_base : t.x_base;
+        require(t.sigmoid->data == static_cast<char *>(overlapped->data) + shift &&
+                    t.sigmoid->buffer == overlapped->buffer,
+                "the raw GLU sigmoid does not sit on its aliased input");
+        for (const ggml_tensor * tensor : all) {
+            require(tensor->buffer == first.get(), "the raw GLU tensors do not share one buffer");
+        }
+        if (variant == "raw_sigmoid_w") {
+            // the trailing add reads the overwritten weight head through a legitimate view of
+            // the weight, resolved now that the weight storage is bound
+            ggml_tensor * view = t.out->src[1];
+            require(view && view->op == GGML_OP_VIEW && view->view_src == t.w_base,
+                    "the raw weight-alias consumer is not a view of the weight");
+            ggml_backend_view_init(view);
+            require(view->data == t.w_base->data && view->buffer == first.get(),
+                    "the raw weight view does not read the aliased head");
+        }
+    }
 };
 
 static bool run_case(ggml_backend_t backend, Fusion & fusion, const mm_glu_case & c, bool expected, FILE * dump) {
@@ -246,10 +294,13 @@ static bool run_case(ggml_backend_t backend, Fusion & fusion, const mm_glu_case 
     const size_t dependencies = optimize(backend, graph);
 
     const bool mapped = variant.rfind("mapped_", 0) == 0;
+    const bool raw = variant.rfind("raw_", 0) == 0;
     MappedArena arena;
     Buffer buffer(nullptr, ggml_backend_buffer_free);
     if (mapped) {
         arena.allocate(backend, t, variant);
+    } else if (raw) {
+        arena.allocate_raw(backend, t, variant);
     } else {
         buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         require(bool(buffer), "cannot allocate the GLU tensors");
@@ -287,6 +338,9 @@ static bool run_case(ggml_backend_t backend, Fusion & fusion, const mm_glu_case 
     };
 
     prepare();
+    // the raw placements alias the sigmoid with an active input byte for byte, so the poison
+    // must recognize those overlapping bytes as protected input storage on every raw case
+    require(!raw || protected_values > 0, "the raw placement protects no active input bytes");
     compute(false);
     const auto ordinary = bytes(t.out);
     const auto saved_mm = gate_public ? bytes(t.mm) : std::vector<uint8_t>{};

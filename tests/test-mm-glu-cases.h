@@ -69,6 +69,18 @@ static std::vector<mm_glu_case> mm_glu_cases() {
                 // only the default (undefined) source precision, so nothing may fuse.
                 cases.push_back({GGML_TYPE_F32, 1024, 1024, 33, swap, "src_f32", false});
             }
+            // Same-buffer raw placements (Metal runner only): the runner binds the whole triple
+            // into one buffer object and puts the sigmoid storage over the activation (exactly
+            // or in part) or over the head of the F32 weight, and a trailing add reads the
+            // aliased input after the product. The ordinary sequence has already overwritten
+            // that input by the time the add runs, while a fused epilogue would skip the
+            // intermediate sigmoid store, so the epilogue must reject every one of these
+            // placements; nothing here may fuse.
+            for (bool swap : {false, true}) {
+                for (const char * variant : {"raw_sigmoid_x", "raw_sigmoid_x_partial", "raw_sigmoid_w"}) {
+                    cases.push_back({GGML_TYPE_F32, 1024, 1024, 33, swap, variant, false});
+                }
+            }
         }
     }
     // BF16 weights are outside the planned gate.
@@ -77,11 +89,12 @@ static std::vector<mm_glu_case> mm_glu_cases() {
 }
 
 /** Cross-backend cases keep the ordinary in-memory semantics; raw output aliases, buffers
- *  overwritten through view_src and the Metal mapped wrappers stay in the Metal runner,
- *  which controls allocation explicitly. */
+ *  overwritten through view_src, the Metal mapped wrappers and the same-buffer raw placements
+ *  stay in the Metal runner, which controls allocation explicitly. */
 static bool mm_glu_case_is_cross_backend(const mm_glu_case & c) {
     const std::string variant(c.variant);
     return variant.rfind("alias", 0) != 0 && variant.rfind("mapped_", 0) != 0 &&
+           variant.rfind("raw_", 0) != 0 &&
            variant != "gate_overwrites_a" && variant != "sigmoid_overwrites_a";
 }
 
@@ -185,9 +198,17 @@ static mm_glu_graph mm_glu_build(ggml_context * ctx, const mm_glu_case & c) {
         sigmoid->view_offs = 0;
     }
 
+    // the same-buffer raw placements observe the aliased input after the product: the ordinary
+    // sigmoid store has overwritten it by then, while a fused epilogue would skip that store.
+    // the F32 weight head is read back through a legitimate view of the weight with the shape
+    // of the product, so no in-place matmul is constructed.
     auto * out = variant == "consumer" ? ggml_scale(ctx, mul, 0.5f) :
                  variant == "gate_reuse" ? ggml_add(ctx, mul, mm) :
-                 variant == "sigmoid_reuse" ? ggml_add(ctx, mul, sigmoid) : mul;
+                 variant == "sigmoid_reuse" ? ggml_add(ctx, mul, sigmoid) :
+                 variant == "raw_sigmoid_x" || variant == "raw_sigmoid_x_partial" ? ggml_add(ctx, mul, x) :
+                 variant == "raw_sigmoid_w" ? ggml_add(ctx, mul,
+                                        ggml_view_2d(ctx, w_base, c.width, c.frames, w_base->nb[1], 0)) :
+                 mul;
     ggml_set_name(out, "glu_out");
     return {w_base, wa, x_base, a_base, x, a, a_mm, mm, sigmoid, mul, out};
 }
