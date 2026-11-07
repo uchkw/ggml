@@ -429,6 +429,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // The mul_mat kernels read src1 row by row and require the inner stride to equal the type size, which the generic kernel asserts.
+    if (op->op == GGML_OP_MUL_MAT && src1->nb[0] != ggml_type_size(src1->type)) {
+        return false;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
