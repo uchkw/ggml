@@ -280,8 +280,8 @@ static bool run_case(ggml_backend_t backend, Fusion & fusion, const mm_glu_case 
         // gate product, sigmoid and mul. Empty view nodes are skipped.
         const ggml_tensor * sequence[4] = {t.a_mm, t.mm, t.sigmoid, t.mul};
         int order = 0;
-        for (int i = 0; i < graph->n_nodes && order < 4; ++i) {
-            const ggml_tensor * node = graph->nodes[i];
+        for (int i = 0; i < ggml_graph_n_nodes(graph) && order < 4; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
             if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
                 node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_CONT) {
                 continue;
