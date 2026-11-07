@@ -173,6 +173,27 @@ kernel void kernel_mul_mm(
 
 #else
 
+constant bool FC_mul_mm_glu      [[function_constant(FC_MUL_MM + 9)]];
+constant bool FC_mul_mm_glu_swap [[function_constant(FC_MUL_MM + 10)]];
+
+// the gate epilogue applies the sigmoid with the arithmetic of kernel_unary's
+// OP_UNARY_NUM_SIGMOID at the call sites, outside these helpers, so that it rounds as F32
+// exactly like the separate unary dispatch before the product
+
+// the separately rounded sigmoid meets the independent factor in the operand order of the fused
+// MUL, with the safe math and contract-off semantics of a separate elementwise product
+inline float mm_glu_mul(float s, float a) {
+    #pragma METAL fp math_mode(safe)
+    #pragma METAL fp contract(off)
+    return FC_mul_mm_glu_swap ? a*s : s*a;
+}
+
+inline float4 mm_glu_mul(float4 s, float4 a) {
+    #pragma METAL fp math_mode(safe)
+    #pragma METAL fp contract(off)
+    return FC_mul_mm_glu_swap ? a*s : s*a;
+}
+
 template<
     typename S0, typename S0_4x4, typename S0_8x8,
     typename S1, typename S1_2x4, typename S1_8x8,
@@ -183,6 +204,7 @@ kernel void kernel_mul_mm(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * factor,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -351,6 +373,28 @@ kernel void kernel_mul_mm(
             (r0 + 32*(sgitg &  1)) + \
             (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
 
+        if (FC_mul_mm_glu) {
+            // the factor tile of this simdgroup sits at the same origin and leading dimension
+            // as C, so its simdgroup_load pairs each thread element with the matching gate
+            // accumulator element and no lane-to-matrix mapping is needed
+            device const float * A = (device const float *) factor +
+                (r0 + 32*(sgitg &  1)) + \
+                (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+            simdgroup_float8x8 mfa[8];
+
+            for (short i = 0; i < 8; i++) {
+                simdgroup_load(mfa[i], A + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            }
+
+            for (short i = 0; i < 8; i++) {
+                FOR_UNROLL (short j = 0; j < 2; ++j) {
+                    const float s = 1.0f/(1.0f + exp(-mc[i].thread_elements()[j]));
+                    mc[i].thread_elements()[j] = mm_glu_mul(s, mfa[i].thread_elements()[j]);
+                }
+            }
+        }
+
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
         }
@@ -371,17 +415,22 @@ kernel void kernel_mul_mm(
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;
 
+                // the factor rows of this partial tile stay inside the valid tail, so the loads
+                // never pass the end of the factor
+                device const float  * A  = (device const float  *) factor + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device const float4 * A4 = (device const float4 *) A;
+
                 threadgroup float  * C  = temp_str + (j*NR0);
                 threadgroup float4 * C4 = (threadgroup float4 *) C;
 
                 int i = 0;
                 for (; i < nr0/4; i++) {
-                    *(D4 + i) = *(C4 + i);
+                    *(D4 + i) = FC_mul_mm_glu ? mm_glu_mul(1.0f/(1.0f + exp(-*(C4 + i))), *(A4 + i)) : *(C4 + i);
                 }
 
                 i *= 4;
                 for (; i < nr0; i++) {
-                    *(D + i) = *(C + i);
+                    *(D + i) = FC_mul_mm_glu ? mm_glu_mul(1.0f/(1.0f + exp(-*(C + i))), *(A + i)) : *(C + i);
                 }
             }
         }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -102,6 +103,19 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
     return bid_a.offs <= bid_b.offs
         ? bid_b.offs - bid_a.offs < ggml_nbytes(a)
         : bid_a.offs - bid_b.offs < ggml_nbytes(b);
+}
+
+// true if the host memory of two tensors overlaps, which a separate Metal mapping of the same
+// storage hides from every Metal-buffer comparison above
+static bool ggml_metal_fusion_data_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a->data || !b->data) {
+        return false;
+    }
+
+    const uintptr_t a_begin = (uintptr_t) a->data;
+    const uintptr_t b_begin = (uintptr_t) b->data;
+
+    return a_begin < b_begin + ggml_nbytes(b) && b_begin < a_begin + ggml_nbytes(a);
 }
 
 // ---- pattern checks ------------------------------------------------------
@@ -707,6 +721,156 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// experimental switch of the gate-projection epilogue: unset or "0" keeps the pattern out of the
+// table's matches, "1" enables it, and any other value is a configuration error
+static bool ggml_metal_mm_glu_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_METAL_MM_GLU");
+        if (value == nullptr || std::strcmp(value, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(value, "1") == 0) {
+            return true;
+        }
+        GGML_ABORT("GGML_METAL_MM_GLU must be 0 or 1");
+    }();
+    return enabled;
+}
+
+// MUL_MAT -> UNARY(SIGMOID) -> MUL computes a * F32(sigmoid(W_gate*x)) in the store of the gate
+// mat-mul on the non-tensor simdgroup path. The factor stays independent: it is neither the gate
+// mat-mul nor the sigmoid, so the expression never folds into a/(1+exp(-gate)) and never fuses a
+// pair of projections. The shapes stay inside the range that reaches this kernel: an activation
+// column count of 16 or fewer takes the few-row MMA or mat-vec dispatch instead, and 384 columns
+// are the upper bound of this gate.
+static bool ggml_metal_fusion_check_mul_mat_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(fusion);
+
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * sig = nodes[1];
+    const ggml_tensor * mul = nodes[2];
+
+    if (!ggml_metal_mm_glu_enabled()) {
+        return false;
+    }
+
+    // the sigmoid reads exactly the gate mat-mul
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != mm || sig->src[1]) {
+        return false;
+    }
+
+    // exactly one input of the MUL is the sigmoid and the other is the independent factor
+    const bool sig_is_src0 = mul->src[0] == sig;
+    const bool sig_is_src1 = mul->src[1] == sig;
+
+    if (sig_is_src0 == sig_is_src1) {
+        return false;
+    }
+
+    const ggml_tensor * factor = sig_is_src0 ? mul->src[1] : mul->src[0];
+
+    if (!factor || factor == mm || factor == sig) {
+        return false;
+    }
+
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+
+    // the gate weight keeps the types of the kernel_mul_mm templates this epilogue extends, and
+    // every activation and result of the triple is F32
+    const ggml_type wtype = w->type;
+    if ((wtype != GGML_TYPE_F32 && wtype != GGML_TYPE_F16 &&
+         wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_K) ||
+        x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        sig->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || factor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // an explicit source precision of the mat-mul stages the operands differently than the plain
+    // kernel, so only the default source precision fuses
+    if (ggml_get_op_params_i32(mm, 3) != GGML_PREC_UNDEFINED) {
+        return false;
+    }
+
+    // the projection dimensions of this gate: the contraction and the gate width are 1024, and
+    // the activation columns run from the smallest mat-mat batch to the gate's upper bound
+    if (w->ne[0] != 1024 || mm->ne[0] != 1024 || mm->ne[1] < 17 || mm->ne[1] > 384) {
+        return false;
+    }
+
+    // contiguous rank-2 tensors of one equal output shape let the kernel address the factor and
+    // the output tiles linearly
+    const ggml_tensor * tensors[] = {w, x, mm, sig, mul, factor};
+    for (const ggml_tensor * t : tensors) {
+        if (!ggml_is_contiguous(t) || !ggml_is_matrix(t)) {
+            return false;
+        }
+    }
+
+    if (!ggml_are_same_shape(factor, sig) || !ggml_are_same_shape(mul, sig)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
+    // the buffers are placed now, so unsafe aliases are rejected here instead of extending the
+    // lifetimes of the inputs: every activation of the triple must share one Metal buffer,
+    // because distinct mappings of the same storage hide their overlap from the range checks
+    const ggml_tensor * activations[] = {x, factor, mm, sig, mul};
+    for (size_t i = 0; i < sizeof(activations)/sizeof(activations[0]); ++i) {
+        for (size_t j = i + 1; j < sizeof(activations)/sizeof(activations[0]); ++j) {
+            if (!ggml_metal_fusion_same_buffer(activations[i], activations[j])) {
+                return false;
+            }
+        }
+    }
+
+    // storage that overlaps through the Metal buffer ranges or through the underlying host
+    // addresses counts as aliased
+    auto storage_overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return ggml_metal_fusion_overlap(a, b) || ggml_metal_fusion_data_overlap(a, b);
+    };
+
+    // the fused store writes the gate product, so the final output must not overwrite either
+    // input of the mat-mul, exactly or partially
+    if (storage_overlap(mul, w) || storage_overlap(mul, x)) {
+        return false;
+    }
+
+    // the fused kernel also elides the intermediate gate product and sigmoid stores. In the
+    // ordinary sequence those stores have landed before any later node runs, so a gate or
+    // sigmoid tensor that overlaps W or x leaves a later reader of that input (for example a
+    // trailing add) reading the overwritten bytes, while the fused execution would skip the
+    // stores and expose the original mat-mul input instead. Rejecting every intermediate
+    // overlap with either mat-mul input is conservative but sound, and it spares the gate from
+    // inspecting the future consumers of W and x.
+    if (storage_overlap(mm, w) || storage_overlap(mm, x) ||
+        storage_overlap(sig, w) || storage_overlap(sig, x)) {
+        return false;
+    }
+
+    // the ordinary sequence computes sigmoid(gate) and only then the product, so gate or sigmoid
+    // storage over the factor would change what the product reads
+    if (storage_overlap(mm, factor) || storage_overlap(sig, factor)) {
+        return false;
+    }
+
+    // of the product itself, only the exact in-place factor is safe: the kernel reads each
+    // factor element before it writes the same element
+    return mul->data == factor->data || !storage_overlap(mul, factor);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -757,6 +921,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -786,6 +951,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MAT_GLU,    ops_mul_mat_glu,            {},     false, ggml_metal_fusion_check_mul_mat_glu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -836,6 +1002,11 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            // the gate-projection epilogue rejects unsafe aliases at full matching after the
+            // allocation instead of extending input lifetimes
+            if (fusion.id == GGML_METAL_FUSION_MUL_MAT_GLU) {
+                continue;
+            }
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }
@@ -1074,6 +1245,7 @@ static bool ggml_metal_fusion_check_memory_ranges(
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
 const ggml_metal_fusion * ggml_metal_fusion_next(
+        const ggml_metal_device_props * props,
         const ggml_cgraph * gf,
         const int * node_idxs,
         int n_idxs,
@@ -1084,6 +1256,11 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     int best = 1;
 
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        // the gate-projection epilogue extends only the non-tensor simdgroup mat-mul store
+        if (fusion.id == GGML_METAL_FUSION_MUL_MAT_GLU && (!props->has_simdgroup_mm || props->has_tensor)) {
+            continue;
+        }
+
         const int n_ops = (int) fusion.ops.size();
 
         // only look for a longer match than the current best
@@ -1168,7 +1345,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index
 // span from idx to the last matched node (intermediate views are packed along).
-int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+int ggml_metal_fusion_max(const ggml_metal_device_props * props, const ggml_cgraph * gf, int idx) {
     // a view node cannot start a pattern - pack it alone
     if (ggml_op_is_empty(gf->nodes[idx]->op)) {
         return 1;
@@ -1192,7 +1369,7 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
 
     while (i_f < n_idxs && total < GGML_METAL_FUSION_MAX) {
         int len = 1;
-        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
+        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(props, gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
             break;
         }

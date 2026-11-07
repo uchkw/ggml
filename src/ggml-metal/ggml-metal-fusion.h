@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_MUL_MAT_GLU,  // MUL_MAT + UNARY (sigmoid) + MUL (gate projection product in the MM store)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
@@ -86,6 +87,7 @@ void ggml_metal_fusion_info_labels_init(      struct ggml_metal_fusion_info * fi
 // compute phase: longest fusion starting at idx (a position in node_idxs) that matches in `mode` on a device with
 // props. returns the matching pattern (nullptr if no fusion) and sets *n_out to the number of nodes consumed.
 const ggml_metal_fusion * ggml_metal_fusion_next(
+        const struct ggml_metal_device_props * props,
         const struct ggml_cgraph * gf,
         const int * node_idxs,
         int n_idxs,
@@ -95,7 +97,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.
-int ggml_metal_fusion_max(const struct ggml_cgraph * gf, int idx);
+int ggml_metal_fusion_max(const struct ggml_metal_device_props * props, const struct ggml_cgraph * gf, int idx);
 
 #ifdef __cplusplus
 }
