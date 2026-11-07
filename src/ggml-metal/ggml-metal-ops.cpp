@@ -3647,6 +3647,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // The row pitch can span several heads, while each copied row contains only its logical values.
+    const uint64_t row_size1 = ggml_row_size(use_kv_f16 ? GGML_TYPE_F16 : op->src[1]->type, ne10);
+    const uint64_t row_size2 = ggml_row_size(use_kv_f16 ? GGML_TYPE_F16 : op->src[2]->type, ne20);
+
     if (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor)) {
         // tensor API kernel
         const int nqptg = ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG; // queries per threadgroup
@@ -3773,6 +3777,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.nb31    =*/nb31,
                 /*.nb32    =*/nb32,
                 /*.nb33    =*/nb33,
+                /*.row_size1 =*/row_size1,
+                /*.row_size2 =*/row_size2,
             };
 
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
@@ -3973,6 +3979,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.nb31    =*/nb31,
                 /*.nb32    =*/nb32,
                 /*.nb33    =*/nb33,
+                /*.row_size1 =*/row_size1,
+                /*.row_size2 =*/row_size2,
             };
 
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);

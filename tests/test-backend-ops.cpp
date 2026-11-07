@@ -8667,6 +8667,32 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_tail_pad : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return "tail_pad=1," + test_flash_attn_ext::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        for (int i : {1, 2}) {
+            ggml_tensor * t = out->src[i];
+            if (i == 2 && v_is_view_of_k) {
+                ggml_tensor * k = out->src[1];
+                out->src[i] = ggml_view_4d(ctx, k, t->ne[0], t->ne[1], t->ne[2], t->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+            } else {
+                // The final row has a full stride of allocated storage even when heads are interleaved.
+                const int64_t blocks = (ggml_nbytes(t) + t->nb[1])/ggml_type_size(t->type);
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, t->type, blocks*ggml_blck_size(t->type));
+                out->src[i] = ggml_view_4d(ctx, storage, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], 0);
+            }
+            ggml_set_name(out->src[i], i == 1 ? "k" : "v");
+        }
+        return out;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -12088,6 +12114,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Partial blocks preserve logical rows in both cache and interleaved-head layouts.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t queries : {1, 20}) {
+            for (int64_t keys : {64, 65}) {
+                test_cases.emplace_back(new test_flash_attn_ext_tail_pad(128, 128, 8, {1, 1}, keys, queries,
+                        false, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, false));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_tail_pad(128, 96, 2, {2, 2}, 33, queries,
+                    true, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext_tail_pad(128, 96, 2, {2, 2}, 65, queries,
+                    true, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, false, true));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t queries : {1, 32}) {
+            for (bool v_view : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext_tail_pad(128, 96, 2, {2, 2}, 65, queries,
+                        true, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}, false, v_view));
+            }
+        }
+    }
 
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
