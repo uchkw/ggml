@@ -35,8 +35,7 @@ static std::vector<head_store_case> head_store_cases() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         cases.push_back({256, type, "plain", false, true});
     }
-    // The CPU matrix product requires the reduction dimension of its first operand to be contiguous.
-    cases.push_back({171, GGML_TYPE_F32, "transpose_a", false, false});
+    cases.push_back({171, GGML_TYPE_F32, "padded_head_a", false, true});
     for (const char * variant : {"mapped_a", "mapped_partial_a", "mapped_b", "mapped_partial_b", "mapped_disjoint"}) {
         cases.push_back({171, GGML_TYPE_F32, variant, false, false});
     }
@@ -64,18 +63,14 @@ static head_store_graph make_head_store_graph(ggml_context * ctx, const head_sto
     const int64_t k = c.frames + (variant == "k_ne_n" ? 1 : 0);
     const int64_t ak = k + (variant == "strided_a" ? 4 : 0);
     const int64_t bk = k + (variant == "strided_b" ? 4 : 0);
+    const int64_t a_head = ak*d + (variant == "padded_head_a" ? 4 : 0);
     const size_t offset = variant == "offset" ? 4*sizeof(float) : 0;
     const int64_t extra_a = ggml_blck_size(c.type) > 1 ? ggml_blck_size(c.type) : 8;
     head_store_graph g{};
-    g.a_storage = ggml_new_tensor_1d(ctx, c.type, ak*d*ah*batch + extra_a);
+    g.a_storage = ggml_new_tensor_1d(ctx, c.type, a_head*ah*batch + extra_a);
     g.b_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, bk*c.frames*h*batch + 8);
     g.a = ggml_view_4d(ctx, g.a_storage, k, d, ah, batch, ggml_row_size(c.type, ak),
-                     ggml_row_size(c.type, ak*d), ggml_row_size(c.type, ak*d*ah), offset);
-    if (variant == "transpose_a") {
-        auto * base = ggml_view_4d(ctx, g.a_storage, d, k, ah, batch, d*sizeof(float),
-                                  d*k*sizeof(float), d*k*ah*sizeof(float), 0);
-        g.a = ggml_transpose(ctx, base);
-    }
+                     ggml_row_size(c.type, a_head), ggml_row_size(c.type, a_head)*ah, offset);
     g.b = ggml_view_4d(ctx, g.b_storage, k, c.frames, h, batch, bk*sizeof(float),
                       bk*c.frames*sizeof(float), bk*c.frames*h*sizeof(float), offset);
     g.mm = ggml_mul_mat(ctx, g.a, g.b);
